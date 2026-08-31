@@ -1,0 +1,49 @@
+name: Desktop Integration
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "integrations/**"
+      - ".github/workflows/desktop-integration.yml"
+  pull_request:
+    paths:
+      - "integrations/**"
+      - ".github/workflows/desktop-integration.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: Installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck integrations/systemd/install.sh
+
+  unit-file:
+    name: systemd unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify unit
+        run: systemd-analyze --user verify integrations/systemd/surge.service
+
+  widget-model:
+    name: Widget model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Model tests
+        run: node integrations/quickshell/tests/model.test.js
