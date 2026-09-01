@@ -217,9 +217,9 @@ docker compose logs -f surge
 ## Linux Desktop Integration
 
 Surge ships a polished Quickshell bar widget, an Omarchy adapter, and a
-systemd user service with automatic token provisioning. The widget monitors
-the live server and can add, pause, and resume downloads without exposing the
-API token to QML.
+systemd user service with automatic token provisioning. The compact bar icon
+indicates connectivity; its panel can add, start, stop, and delete downloads
+without exposing the API token to QML.
 
 See the [Linux desktop integration guide](docs/DESKTOP_INTEGRATION.md).
 

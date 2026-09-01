@@ -45,6 +45,10 @@ assert.equal(summary.progress, 62.5);
 
 assert.equal(model.formatBytes(1024), "1.0 KiB");
 assert.equal(model.formatSpeed(1048576), "1.0 MiB/s");
+assert.equal(model.statusLabel("downloading"), "Downloading");
+assert.equal(model.statusLabel("paused"), "Paused");
+assert.equal(model.statusLabel("failed"), "Failed");
+assert.equal(model.statusLabel("custom-state"), "Custom state");
 assert.equal(model.barLabel(true, false, summary), "1 ↓  1.0 MiB/s");
 assert.equal(model.barLabel(false, false, summary), "Surge offline");
 

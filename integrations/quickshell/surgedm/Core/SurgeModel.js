@@ -78,6 +78,24 @@ function formatSpeed(value) {
   return formatBytes(value) + "/s"
 }
 
+function statusLabel(status) {
+  var value = safeString(status).trim().toLowerCase()
+  var labels = {
+    downloading: "Downloading",
+    queued: "Queued",
+    starting: "Starting",
+    pausing: "Stopping",
+    paused: "Paused",
+    completed: "Completed",
+    failed: "Failed",
+    error: "Failed"
+  }
+  if (labels[value]) return labels[value]
+  if (value === "") return "Unknown"
+  value = value.replace(/[-_]+/g, " ")
+  return value.charAt(0).toUpperCase() + value.slice(1)
+}
+
 function barLabel(available, loading, summary) {
   if (loading && !available) return "Surge …"
   if (!available) return "Surge offline"

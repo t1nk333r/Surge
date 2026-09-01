@@ -4,13 +4,14 @@ Surge includes a Linux desktop integration built from three independent
 pieces:
 
 - a systemd user service that supervises the existing Surge headless server;
-- a reusable Quickshell widget with a compact status pill and control panel;
+- a reusable Quickshell widget with a compact status icon and control panel;
 - an Omarchy bar-widget adapter around the same Quickshell client and UI.
 
-The widget shows server availability, active and paused counts, aggregate
-speed, per-download progress, and connection errors. Its panel can add,
-pause, and resume downloads through Surge's existing CLI/API, and can start
-or stop the supplied systemd user service.
+The widget shows server availability through an icon indicator, plus active
+and paused counts, aggregate speed, per-download progress, and connection
+errors in its panel. Each download can be started, stopped, or deleted through
+Surge's existing CLI/API, and the supplied systemd user service can be started
+or stopped separately.
 
 The integration targets Wayland and does not use X11 APIs. The reusable
 components require Quickshell 0.3.x. The Omarchy adapter follows the Omarchy
@@ -25,6 +26,7 @@ Its asynchronous Quickshell.Io.Process objects invoke:
     surge add URL
     surge pause ID
     surge resume ID
+    surge rm ID
 
 The optional Start and Stop buttons invoke systemctl --user for surge.service.
 Surge's CLI discovers the active local port and credential, then uses the
@@ -278,7 +280,7 @@ that no other Surge installation uses it, then remove the relevant
 
 - Status uses a two-second poll rather than holding Surge's SSE stream open.
   This is simpler and resilient across Quickshell reloads but not instant.
-- The compact panel exposes add, pause, and resume. Full history, delete,
+- The compact panel exposes add, start, stop, and delete. Full history,
   rate-limit editing, and confirmation workflows remain in the TUI/CLI.
 - The supplied unit is Linux/systemd-specific; the reusable Quickshell
   components can still monitor a manually started server.

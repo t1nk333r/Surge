@@ -14,11 +14,37 @@ Rectangle {
   readonly property color mutedColor: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.62)
   readonly property color faintColor: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.08)
   readonly property color borderColor: Qt.rgba(foregroundColor.r, foregroundColor.g, foregroundColor.b, 0.14)
+  readonly property color warningColor: "#f2bd4b"
+
+  function statusColor(status) {
+    var value = String(status || "").toLowerCase()
+    if (value === "failed" || value === "error") return root.urgentColor
+    if (value === "paused" || value === "pausing") return root.warningColor
+    if (value === "completed" || Model.isActive(value)) return root.accentColor
+    return root.mutedColor
+  }
+
+  function summaryText() {
+    if (!root.client.available) return root.client.loading ? "Connecting…" : "Offline"
+    if (root.client.summary.active > 0)
+      return root.client.summary.active + " active · " + Model.formatSpeed(root.client.summary.speed)
+    if (root.client.summary.paused > 0)
+      return root.client.summary.paused + " paused · " + root.client.summary.total + " total"
+    return root.client.summary.total + (root.client.summary.total === 1 ? " download" : " downloads")
+  }
+
+  function statusGlyph(status) {
+    var value = String(status || "").toLowerCase()
+    if (value === "failed" || value === "error") return "!"
+    if (value === "paused" || value === "pausing") return "Ⅱ"
+    if (value === "completed") return "✓"
+    return "↓"
+  }
 
   color: backgroundColor
   radius: 14
-  implicitWidth: 390
-  implicitHeight: 470
+  implicitWidth: 360
+  implicitHeight: 420
   clip: true
 
   component ActionButton: Rectangle {
@@ -29,27 +55,39 @@ Rectangle {
     property bool destructive: false
     signal clicked()
 
-    implicitWidth: Math.max(62, buttonLabel.implicitWidth + 22)
-    implicitHeight: 30
-    radius: 8
+    implicitWidth: Math.max(46, buttonLabel.implicitWidth + 14)
+    implicitHeight: 24
+    radius: 6
     color: {
       if (!enabled) return root.faintColor
-      if (buttonMouse.pressed) return Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.18)
-      if (buttonMouse.containsMouse) return Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.13)
-      return primary ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.18) : root.faintColor
+      if (buttonMouse.pressed)
+        return Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.18)
+      if (destructive && buttonMouse.containsMouse)
+        return Qt.rgba(root.urgentColor.r, root.urgentColor.g, root.urgentColor.b, 0.16)
+      if (buttonMouse.containsMouse)
+        return Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.13)
+      if (primary)
+        return Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.18)
+      if (destructive)
+        return Qt.rgba(root.urgentColor.r, root.urgentColor.g, root.urgentColor.b, 0.08)
+      return root.faintColor
     }
     border.width: 1
-    border.color: primary ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.45) : root.borderColor
+    border.color: destructive
+      ? Qt.rgba(root.urgentColor.r, root.urgentColor.g, root.urgentColor.b, 0.3)
+      : (primary ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.45) : root.borderColor)
     opacity: enabled ? 1 : 0.45
 
     Text {
       id: buttonLabel
       anchors.centerIn: parent
       text: actionButton.label
-      color: actionButton.destructive ? root.urgentColor : (actionButton.primary ? root.accentColor : root.foregroundColor)
+      color: actionButton.destructive
+        ? root.urgentColor
+        : (actionButton.primary ? root.accentColor : root.foregroundColor)
       font.family: root.fontFamily
-      font.pixelSize: 12
-      font.weight: Font.DemiBold
+      font.pixelSize: 10
+      font.weight: Font.Medium
     }
 
     MouseArea {
@@ -64,42 +102,29 @@ Rectangle {
 
   Column {
     anchors.fill: parent
-    anchors.margins: 16
-    spacing: 12
+    anchors.margins: 11
+    spacing: 8
 
     Item {
       width: parent.width
-      height: 42
+      height: 38
 
-      Column {
+      Rectangle {
+        id: serviceDot
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
-        spacing: 2
-
-        Text {
-          text: "SurgeDM"
-          color: root.foregroundColor
-          font.family: root.fontFamily
-          font.pixelSize: 18
-          font.weight: Font.DemiBold
-        }
-
-        Text {
-          text: root.client.available
-            ? (root.client.summary.active > 0
-                ? root.client.summary.active + " active · " + Model.formatSpeed(root.client.summary.speed)
-                : "Connected · ready")
-            : (root.client.loading ? "Connecting…" : "Offline")
-          color: root.client.available ? root.accentColor : root.mutedColor
-          font.family: root.fontFamily
-          font.pixelSize: 11
-        }
+        width: 7
+        height: 7
+        radius: 4
+        color: root.client.available ? root.accentColor : root.urgentColor
+        opacity: root.client.loading ? 0.55 : 1
       }
 
       Row {
+        id: headerActions
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        spacing: 7
+        spacing: 5
 
         ActionButton {
           label: "Refresh"
@@ -115,28 +140,69 @@ Rectangle {
           onClicked: root.client.serviceAction(root.client.available ? "stop" : "start")
         }
       }
+
+      Column {
+        anchors.left: serviceDot.right
+        anchors.right: headerActions.left
+        anchors.leftMargin: 7
+        anchors.rightMargin: 8
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 1
+        clip: true
+
+        Text {
+          width: parent.width
+          text: "SURGEDM"
+          color: root.foregroundColor
+          font.family: root.fontFamily
+          font.pixelSize: 11
+          font.weight: Font.DemiBold
+          elide: Text.ElideRight
+        }
+
+        Text {
+          width: parent.width
+          text: root.summaryText()
+          color: root.client.available ? root.mutedColor : root.urgentColor
+          font.family: root.fontFamily
+          font.pixelSize: 9
+          elide: Text.ElideRight
+        }
+      }
     }
 
     Rectangle {
       width: parent.width
-      height: 38
-      radius: 9
+      height: 34
+      radius: 7
       color: root.faintColor
       border.width: 1
       border.color: addInput.activeFocus ? root.accentColor : root.borderColor
 
+      Text {
+        id: addIcon
+        anchors.left: parent.left
+        anchors.leftMargin: 9
+        anchors.verticalCenter: parent.verticalCenter
+        text: "↓"
+        color: addInput.activeFocus ? root.accentColor : root.mutedColor
+        font.family: root.fontFamily
+        font.pixelSize: 12
+        font.weight: Font.Medium
+      }
+
       TextInput {
         id: addInput
-        anchors.left: parent.left
+        anchors.left: addIcon.right
         anchors.right: addButton.left
-        anchors.leftMargin: 12
-        anchors.rightMargin: 8
+        anchors.leftMargin: 7
+        anchors.rightMargin: 6
         anchors.verticalCenter: parent.verticalCenter
         color: root.foregroundColor
         selectionColor: root.accentColor
         selectedTextColor: root.backgroundColor
         font.family: root.fontFamily
-        font.pixelSize: 12
+        font.pixelSize: 10
         clip: true
         selectByMouse: true
         onAccepted: {
@@ -160,7 +226,7 @@ Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         label: "Add"
         primary: true
-        enabled: !root.client.actionRunning
+        enabled: !root.client.actionRunning && addInput.text.trim() !== ""
         onClicked: {
           if (root.client.add(addInput.text)) addInput.text = ""
         }
@@ -170,21 +236,50 @@ Rectangle {
     Rectangle {
       visible: root.client.errorText !== "" || root.client.actionMessage !== ""
       width: parent.width
-      height: messageText.implicitHeight + 16
-      radius: 8
+      height: messageText.implicitHeight + 12
+      radius: 6
       color: root.client.errorText !== ""
         ? Qt.rgba(root.urgentColor.r, root.urgentColor.g, root.urgentColor.b, 0.12)
         : root.faintColor
+      border.width: 1
+      border.color: root.client.errorText !== ""
+        ? Qt.rgba(root.urgentColor.r, root.urgentColor.g, root.urgentColor.b, 0.32)
+        : root.borderColor
 
       Text {
         id: messageText
         anchors.fill: parent
-        anchors.margins: 8
+        anchors.margins: 6
         text: root.client.errorText || root.client.actionMessage
         color: root.client.errorText !== "" ? root.urgentColor : root.mutedColor
         font.family: root.fontFamily
-        font.pixelSize: 11
+        font.pixelSize: 9
         wrapMode: Text.Wrap
+      }
+    }
+
+    Item {
+      visible: root.client.available
+      width: parent.width
+      height: visible ? 18 : 0
+
+      Text {
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: "DOWNLOADS"
+        color: root.foregroundColor
+        font.family: root.fontFamily
+        font.pixelSize: 10
+        font.weight: Font.DemiBold
+      }
+
+      Text {
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.client.summary.total + " total"
+        color: root.mutedColor
+        font.family: root.fontFamily
+        font.pixelSize: 9
       }
     }
 
@@ -195,10 +290,13 @@ Rectangle {
       Text {
         anchors.centerIn: parent
         visible: root.client.available && root.client.downloads.length === 0
-        text: "No downloads yet"
+        width: parent.width
+        text: "No downloads yet.\nPaste a URL above to get started."
         color: root.mutedColor
         font.family: root.fontFamily
-        font.pixelSize: 13
+        font.pixelSize: 10
+        horizontalAlignment: Text.AlignHCenter
+        wrapMode: Text.WordWrap
       }
 
       Text {
@@ -212,7 +310,7 @@ Rectangle {
           : "Check the Surge host and authentication settings."
         color: root.mutedColor
         font.family: root.fontFamily
-        font.pixelSize: 13
+        font.pixelSize: 10
       }
 
       Text {
@@ -221,7 +319,7 @@ Rectangle {
         text: "Connecting…"
         color: root.mutedColor
         font.family: root.fontFamily
-        font.pixelSize: 13
+        font.pixelSize: 10
       }
 
       ListView {
@@ -229,59 +327,78 @@ Rectangle {
         anchors.fill: parent
         visible: root.client.available && root.client.downloads.length > 0
         clip: true
-        spacing: 7
+        spacing: 6
         model: root.client.downloads
         boundsBehavior: Flickable.StopAtBounds
 
         delegate: Rectangle {
           id: row
           required property var modelData
+          readonly property color stateColor: root.statusColor(modelData.status)
           width: downloadList.width
-          height: 64
-          radius: 9
-          color: root.faintColor
+          height: 82
+          radius: 7
+          color: rowHover.containsMouse
+            ? Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.1)
+            : root.faintColor
           border.width: 1
-          border.color: root.borderColor
+          border.color: rowHover.containsMouse
+            ? Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.18)
+            : root.borderColor
+
+          MouseArea {
+            id: rowHover
+            anchors.fill: parent
+            acceptedButtons: Qt.NoButton
+            hoverEnabled: true
+          }
 
           Column {
-            anchors.left: parent.left
-            anchors.right: rowAction.left
-            anchors.top: parent.top
-            anchors.leftMargin: 11
-            anchors.rightMargin: 10
-            anchors.topMargin: 9
-            spacing: 5
-
-            Text {
-              width: parent.width
-              text: row.modelData.filename
-              color: root.foregroundColor
-              font.family: root.fontFamily
-              font.pixelSize: 12
-              font.weight: Font.Medium
-              elide: Text.ElideMiddle
-            }
+            anchors.fill: parent
+            anchors.margins: 7
+            spacing: 4
 
             Row {
-              spacing: 8
+              width: parent.width
+              height: 27
+              spacing: 7
+
               Text {
-                text: row.modelData.status
-                color: row.modelData.status === "failed" ? root.urgentColor : root.mutedColor
+                anchors.verticalCenter: parent.verticalCenter
+                width: 18
+                text: root.statusGlyph(row.modelData.status)
+                color: row.stateColor
                 font.family: root.fontFamily
-                font.pixelSize: 10
+                font.pixelSize: 14
+                font.weight: Font.DemiBold
+                horizontalAlignment: Text.AlignHCenter
               }
-              Text {
-                text: Math.round(row.modelData.progress) + "%"
-                color: root.mutedColor
-                font.family: root.fontFamily
-                font.pixelSize: 10
-              }
-              Text {
-                visible: row.modelData.speed > 0
-                text: Model.formatSpeed(row.modelData.speed)
-                color: root.accentColor
-                font.family: root.fontFamily
-                font.pixelSize: 10
+
+              Column {
+                width: parent.width - 25
+                spacing: 1
+                clip: true
+
+                Text {
+                  width: parent.width
+                  text: row.modelData.filename
+                  color: root.foregroundColor
+                  font.family: root.fontFamily
+                  font.pixelSize: 10
+                  font.weight: Font.DemiBold
+                  elide: Text.ElideMiddle
+                }
+
+                Text {
+                  width: parent.width
+                  text: Model.statusLabel(row.modelData.status)
+                    + "  ·  " + Math.round(row.modelData.progress) + "%"
+                    + (row.modelData.speed > 0 ? "  ·  " + Model.formatSpeed(row.modelData.speed) : "")
+                  color: row.stateColor
+                  font.family: root.fontFamily
+                  font.pixelSize: 9
+                  elide: Text.ElideRight
+                }
               }
             }
 
@@ -294,23 +411,34 @@ Rectangle {
               Rectangle {
                 width: parent.width * Math.max(0, Math.min(100, row.modelData.progress)) / 100
                 height: parent.height
-                radius: 2
-                color: root.accentColor
+                radius: parent.radius
+                color: row.stateColor
+                Behavior on width {
+                  NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+                }
               }
             }
-          }
 
-          ActionButton {
-            id: rowAction
-            anchors.right: parent.right
-            anchors.rightMargin: 9
-            anchors.verticalCenter: parent.verticalCenter
-            visible: row.modelData.status === "paused" || Model.isActive(row.modelData.status)
-            label: row.modelData.status === "paused" ? "Resume" : "Pause"
-            enabled: !root.client.actionRunning
-            onClicked: {
-              if (row.modelData.status === "paused") root.client.resume(row.modelData.id)
-              else root.client.pause(row.modelData.id)
+            Row {
+              spacing: 5
+
+              ActionButton {
+                visible: row.modelData.status === "paused" || Model.isActive(row.modelData.status)
+                label: row.modelData.status === "paused" ? "Start" : "Stop"
+                primary: row.modelData.status === "paused"
+                enabled: !root.client.actionRunning
+                onClicked: {
+                  if (row.modelData.status === "paused") root.client.resume(row.modelData.id)
+                  else root.client.pause(row.modelData.id)
+                }
+              }
+
+              ActionButton {
+                label: "Delete"
+                destructive: true
+                enabled: !root.client.actionRunning
+                onClicked: root.client.removeDownload(row.modelData.id)
+              }
             }
           }
         }

@@ -134,6 +134,10 @@ Item {
     return runAction(["resume", String(id)], "Download resumed.")
   }
 
+  function removeDownload(id) {
+    return runAction(["rm", String(id)], "Download removed.")
+  }
+
   function serviceAction(verb) {
     if (!serviceControlsEnabled || actionProcess.running) return false
     var allowed = { start: true, stop: true, restart: true }

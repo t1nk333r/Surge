@@ -64,36 +64,24 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    labelVisible: false
-    hasVisualContent: true
+    text: "󰇚"
+    foreground: root.bar ? root.bar.barForeground : Color.foreground
     tooltipText: root.available
       ? ("SurgeDM connected · " + root.statusLabel)
       : "SurgeDM offline · click for controls"
-    fixedWidth: root.vertical ? -1 : Math.ceil(contentRow.implicitWidth + Style.spaceReal(16))
-    fixedHeight: root.vertical ? Math.ceil(contentRow.implicitHeight + Style.spaceReal(12)) : -1
+    fixedWidth: root.vertical ? -1 : Style.space(27)
+    fixedHeight: root.vertical ? Style.space(26) : -1
 
-    Row {
-      id: contentRow
-      anchors.centerIn: parent
-      spacing: Style.space(6)
-
-      Rectangle {
-        anchors.verticalCenter: parent.verticalCenter
-        width: Style.space(7)
-        height: width
-        radius: width / 2
-        color: root.available ? Color.accent : Color.urgent
-        opacity: root.client && root.client.loading ? 0.55 : 1
-      }
-
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.statusLabel
-        color: root.bar ? root.bar.barForeground : Color.foreground
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Style.bar.iconFont
-        renderType: Text.NativeRendering
-      }
+    Rectangle {
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.rightMargin: Style.space(4)
+      anchors.topMargin: Style.space(4)
+      width: Style.space(6)
+      height: width
+      radius: width / 2
+      color: root.available ? Color.accent : Color.urgent
+      opacity: root.client && root.client.loading ? 0.55 : 1
     }
 
     onPressed: function(mouseButton) {

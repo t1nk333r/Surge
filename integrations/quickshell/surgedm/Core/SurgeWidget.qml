@@ -50,7 +50,7 @@ Item {
   Rectangle {
     id: pill
     anchors.fill: parent
-    implicitWidth: pillRow.implicitWidth + 20
+    implicitWidth: 30
     implicitHeight: 30
     radius: 9
     color: pillMouse.containsMouse
@@ -61,28 +61,25 @@ Item {
       ? Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.38)
       : Qt.rgba(root.foregroundColor.r, root.foregroundColor.g, root.foregroundColor.b, 0.16)
 
-    Row {
-      id: pillRow
+    Text {
       anchors.centerIn: parent
-      spacing: 7
+      text: "󰇚"
+      color: root.foregroundColor
+      font.family: root.fontFamily
+      font.pixelSize: 16
+      renderType: Text.NativeRendering
+    }
 
-      Rectangle {
-        anchors.verticalCenter: parent.verticalCenter
-        width: 7
-        height: 7
-        radius: 4
-        color: surgeClient.available ? root.accentColor : root.urgentColor
-        opacity: surgeClient.loading ? 0.55 : 1
-      }
-
-      Text {
-        anchors.verticalCenter: parent.verticalCenter
-        text: surgeClient.label
-        color: root.foregroundColor
-        font.family: root.fontFamily
-        font.pixelSize: 12
-        font.weight: Font.Medium
-      }
+    Rectangle {
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.rightMargin: 4
+      anchors.bottomMargin: 4
+      width: 6
+      height: 6
+      radius: 3
+      color: surgeClient.available ? root.accentColor : root.urgentColor
+      opacity: surgeClient.loading ? 0.55 : 1
     }
 
     MouseArea {
@@ -105,8 +102,8 @@ Item {
     anchor.gravity: root.popupAbove ? (Edges.Top | Edges.Left) : (Edges.Bottom | Edges.Left)
     anchor.margins.top: root.popupAbove ? 0 : 8
     anchor.margins.bottom: root.popupAbove ? 8 : 0
-    implicitWidth: 390
-    implicitHeight: 470
+    implicitWidth: 360
+    implicitHeight: 420
     color: "transparent"
     grabFocus: true
 
