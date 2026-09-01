@@ -1,0 +1,4 @@
+module SurgeDM
+SurgeClient 1.0 SurgeClient.qml
+SurgePanelContent 1.0 SurgePanelContent.qml
+SurgeWidget 1.0 SurgeWidget.qml

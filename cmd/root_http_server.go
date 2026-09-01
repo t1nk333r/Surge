@@ -40,11 +40,10 @@ func resolveRuntimeDir() string {
 
 const serverBindHost = "0.0.0.0"
 
-// findAvailablePort tries ports starting from 'start' until one is available
-func findAvailablePort(start int) (int, net.Listener) {
-	bindHost := serverBindHost
+// findAvailablePortOnHost tries ports starting from start on bindHost.
+func findAvailablePortOnHost(bindHost string, start int) (int, net.Listener) {
 	for port := start; port < start+100; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, port))
+		ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, fmt.Sprintf("%d", port)))
 		if err == nil {
 			return port, ln
 		}
@@ -52,20 +51,35 @@ func findAvailablePort(start int) (int, net.Listener) {
 	return 0, nil
 }
 
-func bindServerListener(portFlag int) (int, net.Listener, error) {
-	bindHost := serverBindHost
+// findAvailablePort preserves the default all-interface listener used by the
+// interactive server and existing callers.
+func findAvailablePort(start int) (int, net.Listener) {
+	return findAvailablePortOnHost(serverBindHost, start)
+}
+
+func bindServerListenerOnHost(portFlag int, bindHost string) (int, net.Listener, error) {
+	bindHost = strings.TrimSpace(bindHost)
+	if bindHost == "" {
+		return 0, nil, fmt.Errorf("bind host cannot be empty")
+	}
+
 	if portFlag > 0 {
-		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, portFlag))
+		address := net.JoinHostPort(bindHost, fmt.Sprintf("%d", portFlag))
+		ln, err := net.Listen("tcp", address)
 		if err != nil {
-			return 0, nil, fmt.Errorf("could not bind to port %d: %w", portFlag, err)
+			return 0, nil, fmt.Errorf("could not bind to %s: %w", address, err)
 		}
 		return portFlag, ln, nil
 	}
-	port, ln := findAvailablePort(1700)
+	port, ln := findAvailablePortOnHost(bindHost, 1700)
 	if ln == nil {
-		return 0, nil, fmt.Errorf("could not find available port")
+		return 0, nil, fmt.Errorf("could not find an available port on %s", bindHost)
 	}
 	return port, ln, nil
+}
+
+func bindServerListener(portFlag int) (int, net.Listener, error) {
+	return bindServerListenerOnHost(portFlag, serverBindHost)
 }
 
 // saveActivePort writes the active port for local CLI and extension discovery.

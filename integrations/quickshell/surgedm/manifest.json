@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.surgedm.desktop",
+  "name": "SurgeDM",
+  "version": "1.0.0",
+  "author": "SurgeDM contributors",
+  "license": "MIT",
+  "homepage": "https://github.com/SurgeDM/Surge",
+  "repository": "https://github.com/SurgeDM/Surge",
+  "description": "Monitor and control a local SurgeDM server from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "SurgeDM",
+    "description": "Download status and controls",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "settings": {
+    "command": {
+      "type": "string",
+      "default": "surge",
+      "description": "Surge executable name or absolute path"
+    },
+    "host": {
+      "type": "string",
+      "default": "",
+      "description": "Optional host:port or URL; empty auto-detects the local server"
+    },
+    "pollInterval": {
+      "type": "integer",
+      "default": 2000,
+      "description": "Refresh interval in milliseconds (minimum 500)"
+    },
+    "downloadDirectory": {
+      "type": "string",
+      "default": "",
+      "description": "Optional output directory for downloads added from the widget"
+    },
+    "serviceUnit": {
+      "type": "string",
+      "default": "surge.service",
+      "description": "systemd user unit controlled by the Start and Stop buttons"
+    },
+    "serviceControlsEnabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Show controls for the systemd user service"
+    }
+  }
+}

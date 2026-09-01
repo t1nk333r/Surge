@@ -66,6 +66,23 @@ func TestFindAvailablePort_ReturnsListener(t *testing.T) {
 	}
 }
 
+func TestBindServerListenerOnHost_Loopback(t *testing.T) {
+	requireTCPListener(t)
+	port, ln, err := bindServerListenerOnHost(0, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("bindServerListenerOnHost failed: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	if !addr.IP.IsLoopback() {
+		t.Fatalf("listener address = %s, want loopback", addr.IP)
+	}
+	if addr.Port != port {
+		t.Fatalf("listener port = %d, returned port = %d", addr.Port, port)
+	}
+}
+
 func TestFindAvailablePort_SkipsOccupiedPorts(t *testing.T) {
 	requireTCPListener(t)
 	// Occupy any port
@@ -1487,6 +1504,17 @@ func TestLsCmd_Flags(t *testing.T) {
 	watchFlag := lsCmd.Flags().Lookup("watch")
 	if watchFlag == nil {
 		t.Error("Missing 'watch' flag")
+	}
+
+	serverOnlyFlag := lsCmd.Flags().Lookup("server-only")
+	if serverOnlyFlag == nil {
+		t.Error("Missing 'server-only' flag")
+	}
+}
+
+func TestServerCmd_BindFlag(t *testing.T) {
+	if serverCmd.PersistentFlags().Lookup("bind") == nil {
+		t.Error("Missing 'bind' flag")
 	}
 }
 

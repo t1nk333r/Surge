@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"fmt"
-
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,6 +65,7 @@ var serverStartCmd = &cobra.Command{
 
 		portFlag, _ := cmd.Flags().GetInt("port")
 		batchFile, _ := cmd.Flags().GetString("batch")
+		bindHost, _ := cmd.Flags().GetString("bind")
 		outputDir, _ := cmd.Flags().GetString("output")
 		exitWhenDone, _ := cmd.Flags().GetBool("exit-when-done")
 		noResume, _ := cmd.Flags().GetBool("no-resume")
@@ -75,7 +76,7 @@ var serverStartCmd = &cobra.Command{
 
 		// Get token flag
 		tokenFlag := resolveServerToken(cmd)
-		return startServerLogic(cmd, args, portFlag, batchFile, outputDir, exitWhenDone, noResume, tokenFlag)
+		return startServerLogic(cmd, args, portFlag, bindHost, batchFile, outputDir, exitWhenDone, noResume, tokenFlag)
 	},
 }
 
@@ -144,6 +145,7 @@ func init() {
 
 	serverCmd.PersistentFlags().StringP("batch", "b", "", "File containing URLs to download")
 	serverCmd.PersistentFlags().IntP("port", "p", 0, "Port to listen on")
+	serverCmd.PersistentFlags().String("bind", serverBindHost, "Address to listen on")
 	serverCmd.PersistentFlags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
 	serverCmd.PersistentFlags().Bool("exit-when-done", false, "Exit when all downloads complete")
 	serverCmd.PersistentFlags().Bool("no-resume", false, "Do not auto-resume paused downloads on startup")
@@ -182,8 +184,8 @@ func readPID() int {
 	return pid
 }
 
-func startServerLogic(cmd *cobra.Command, args []string, portFlag int, batchFile string, outputDir string, exitWhenDone bool, noResume bool, tokenOverride string) error {
-	port, listener, err := bindServerListener(portFlag)
+func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost string, batchFile string, outputDir string, exitWhenDone bool, noResume bool, tokenOverride string) error {
+	port, listener, err := bindServerListenerOnHost(portFlag, bindHost)
 	if err != nil {
 		return err
 	}
@@ -204,8 +206,7 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, batchFile
 	})
 
 	fmt.Printf("Surge %s running in server mode.\n", Version)
-	host := serverBindHost
-	fmt.Printf("Serving on %s:%d\n", host, port)
+	fmt.Printf("Serving on %s\n", net.JoinHostPort(bindHost, fmt.Sprintf("%d", port)))
 	fmt.Println("Press Ctrl+C to exit.")
 
 	StartHeadlessConsumer(cmd.Root().Context(), GlobalService)

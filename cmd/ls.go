@@ -28,18 +28,19 @@ var lsCmd = &cobra.Command{
 
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		watch, _ := cmd.Flags().GetBool("watch")
+		serverOnly, _ := cmd.Flags().GetBool("server-only")
 
-		baseURL, token, err := resolveAPIConnection(false)
+		baseURL, token, err := resolveAPIConnection(serverOnly)
 		if err != nil {
 			return err
 		}
 
+		strictRemote := serverOnly || resolveHostTarget() != ""
+
 		// If ID provided, show details for that download
 		if len(args) == 1 {
-			return showDownloadDetails(args[0], jsonOutput, baseURL, token)
+			return showDownloadDetails(args[0], jsonOutput, baseURL, token, strictRemote)
 		}
-
-		strictRemote := resolveHostTarget() != ""
 
 		if watch {
 			for {
@@ -165,8 +166,7 @@ func printDownloads(jsonOutput bool, baseURL string, token string, strictRemote 
 	return nil
 }
 
-func showDownloadDetails(partialID string, jsonOutput bool, baseURL string, token string) error {
-	strictRemote := resolveHostTarget() != ""
+func showDownloadDetails(partialID string, jsonOutput bool, baseURL string, token string, strictRemote bool) error {
 
 	// Resolve partial ID
 	fullID, err := resolveDownloadID(partialID)
@@ -266,4 +266,5 @@ func init() {
 	rootCmd.AddCommand(lsCmd)
 	lsCmd.Flags().Bool("json", false, "Output in JSON format")
 	lsCmd.Flags().Bool("watch", false, "Watch mode: refresh every second")
+	lsCmd.Flags().Bool("server-only", false, "Require a live server instead of falling back to the local database")
 }

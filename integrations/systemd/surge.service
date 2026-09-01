@@ -1,0 +1,28 @@
+[Unit]
+Description=SurgeDM download manager server
+Documentation=https://github.com/SurgeDM/Surge
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/surge/desktop.env
+ExecStart=/usr/bin/env surge server --bind 127.0.0.1
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# Conservative hardening that keeps user-selected download paths writable.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

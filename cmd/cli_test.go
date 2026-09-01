@@ -800,6 +800,29 @@ func TestPrintDownloads_StrictRemoteEmpty_DoesNotFallbackToDB(t *testing.T) {
 	}
 }
 
+func TestLsCmd_ServerOnlyRequiresRunningServer(t *testing.T) {
+	setupIsolatedCmdState(t)
+	removeActivePort()
+	t.Setenv("SURGE_HOST", "")
+
+	originalHost := globalHost
+	globalHost = ""
+	t.Cleanup(func() { globalHost = originalHost })
+
+	if err := lsCmd.Flags().Set("server-only", "true"); err != nil {
+		t.Fatalf("failed to set --server-only: %v", err)
+	}
+	t.Cleanup(func() { _ = lsCmd.Flags().Set("server-only", "false") })
+
+	err := lsCmd.RunE(lsCmd, nil)
+	if err == nil {
+		t.Fatal("expected --server-only to fail without a running server")
+	}
+	if !strings.Contains(err.Error(), "surge is not running locally") {
+		t.Fatalf("unexpected --server-only error: %v", err)
+	}
+}
+
 func TestShowDownloadDetails_UsesDatabaseFallback(t *testing.T) {
 	setupIsolatedCmdState(t)
 	removeActivePort()
@@ -817,7 +840,7 @@ func TestShowDownloadDetails_UsesDatabaseFallback(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := showDownloadDetails("87654321", true, "", ""); err != nil {
+		if err := showDownloadDetails("87654321", true, "", "", false); err != nil {
 			t.Fatalf("showDownloadDetails fallback failed: %v", err)
 		}
 	})

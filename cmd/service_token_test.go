@@ -7,6 +7,7 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -120,6 +121,16 @@ func TestEnsureAuthToken_CreatesTokenFile(t *testing.T) {
 	// Token must be persisted so the next call returns the same value.
 	token2 := ensureAuthToken()
 	assert.Equal(t, token, token2, "ensureAuthToken should be idempotent")
+
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(resolveTokenPath())
+		require.NoError(t, err)
+		assert.Equal(
+			t,
+			os.FileMode(0o600),
+			info.Mode().Perm(),
+			"the persisted user token must only be readable by its owner")
+	}
 }
 
 func TestEnsureAuthToken_ReadsExistingToken(t *testing.T) {

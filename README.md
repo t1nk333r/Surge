@@ -214,6 +214,17 @@ docker compose logs -f surge
 
 ---
 
+## Linux Desktop Integration
+
+Surge ships a polished Quickshell bar widget, an Omarchy adapter, and a
+systemd user service with automatic token provisioning. The widget monitors
+the live server and can add, pause, and resume downloads without exposing the
+API token to QML.
+
+See the [Linux desktop integration guide](docs/DESKTOP_INTEGRATION.md).
+
+---
+
 ## Fonts
 
 Surge ships a bundled Nerd Font for the TUI, but your terminal controls the
