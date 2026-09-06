@@ -114,34 +114,62 @@ Item {
     return true
   }
 
+  // Every positional operand is passed after `--`. The Surge CLI parses
+  // interspersed flags, so an unterminated value such as `--batch=<path>`
+  // would be read as an option instead of a URL or an id.
   function add(url) {
     var value = String(url || "").trim()
     if (value === "") {
       actionMessage = "Enter a download URL."
       return false
     }
-    var args = ["add", value]
+    if (!Model.isDownloadUrl(value)) {
+      actionMessage = "Only http:// and https:// URLs can be added."
+      return false
+    }
+
+    var args = ["add"]
     var output = String(downloadDirectory || "").trim()
-    if (output !== "") args.push("--output", output)
+    if (output !== "") {
+      if (!Model.isAbsolutePath(output)) {
+        actionMessage = "The download directory must be an absolute path."
+        return false
+      }
+      args.push("--output", output)
+    }
+    args.push("--", value)
     return runAction(args, "Download added.")
   }
 
+  function downloadAction(verb, id, successMessage) {
+    var value = String(id === undefined || id === null ? "" : id)
+    if (!Model.isDownloadId(value)) {
+      actionMessage = "Surge reported a download id this widget will not use."
+      return false
+    }
+    return runAction([verb, "--", value], successMessage)
+  }
+
   function pause(id) {
-    return runAction(["pause", String(id)], "Download paused.")
+    return downloadAction("pause", id, "Download paused.")
   }
 
   function resume(id) {
-    return runAction(["resume", String(id)], "Download resumed.")
+    return downloadAction("resume", id, "Download resumed.")
   }
 
   function removeDownload(id) {
-    return runAction(["rm", String(id)], "Download removed.")
+    return downloadAction("rm", id, "Download removed.")
   }
 
   function serviceAction(verb) {
     if (!serviceControlsEnabled || actionProcess.running) return false
     var allowed = { start: true, stop: true, restart: true }
     if (!allowed[verb]) return false
+    if (!Model.isServiceUnit(root.serviceUnit)) {
+      actionMessage = "Configure serviceUnit as a systemd unit name, e.g. surge.service."
+      return false
+    }
 
     actionExited = false
     actionStdoutDone = false
@@ -152,7 +180,7 @@ Item {
     actionSuccessMessage = "Service " + verb + " requested."
     actionMessage = ""
     actionRunning = true
-    actionProcess.command = ["systemctl", "--user", verb, root.serviceUnit]
+    actionProcess.command = ["systemctl", "--user", verb, "--", root.serviceUnit]
     actionProcess.running = true
     return true
   }

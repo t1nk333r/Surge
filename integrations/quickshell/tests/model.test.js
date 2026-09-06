@@ -62,4 +62,48 @@ assert.match(
 );
 assert.throws(() => model.parseDownloads("{}"), /non-array/);
 
+// Argument shapes. These guard the CLI argv the widget builds: an operand
+// beginning with `-` would be parsed as a flag (e.g. `surge add --batch=FILE`
+// reads a file, `surge rm --clean` wipes every completed record).
+assert.equal(model.isDownloadUrl("https://example.com/a.iso"), true);
+assert.equal(model.isDownloadUrl("http://example.com/a.iso"), true);
+assert.equal(model.isDownloadUrl("--batch=/home/u/.local/state/surge/token"), false);
+assert.equal(model.isDownloadUrl("file:///etc/passwd"), false);
+assert.equal(model.isDownloadUrl("example.com/a.iso"), false);
+assert.equal(model.isDownloadUrl(""), false);
+
+assert.equal(model.isDownloadId("abc-123_x.4:5"), true);
+assert.equal(model.isDownloadId("--clean"), false);
+assert.equal(model.isDownloadId(""), false);
+assert.equal(model.isDownloadId("a b"), false);
+
+assert.equal(model.isServiceUnit("surge.service"), true);
+assert.equal(model.isServiceUnit("surge@user.service"), true);
+assert.equal(model.isServiceUnit("-H root@remote"), false);
+assert.equal(model.isServiceUnit("surge"), false);
+
+assert.equal(model.isAbsolutePath("/home/u/Downloads"), true);
+assert.equal(model.isAbsolutePath("~/Downloads"), false);
+assert.equal(model.isAbsolutePath("Downloads"), false);
+
+// A server-supplied id that cannot be used as an operand must not become a row
+// with buttons that would run the wrong command.
+const hostile = model.parseDownloads(JSON.stringify([
+  { id: "--clean", filename: "evil.iso", status: "downloading" },
+  { id: "", filename: "nameless.iso", status: "paused" },
+  { id: "good-1", filename: "ok.iso", status: "downloading" }
+]));
+assert.equal(hostile.length, 1);
+assert.equal(hostile[0].id, "good-1");
+
+// Diagnostics reach the always-visible bar tooltip: drop URL userinfo and cap
+// the length instead of pasting a raw stderr line onto the bar.
+assert.equal(
+  model.actionError(1, "dial https://user:secret@example.com:1700 failed", ""),
+  "dial https://example.com:1700 failed"
+);
+const long = model.connectionError(1, "x".repeat(400), "");
+assert.equal(long.length, 160);
+assert.equal(long.slice(-1), "…");
+
 console.log("SurgeModel tests passed");

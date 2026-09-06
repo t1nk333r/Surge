@@ -11,18 +11,44 @@ RestartSec=3s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
 
-# Conservative hardening that keeps user-selected download paths writable.
+# Hardening. Four omissions are deliberate:
+#   ProtectHome — Surge downloads to user-selected destinations under $HOME.
+#   PrivateTmp  — with it, a download whose destination is /tmp or /var/tmp
+#                 lands in the service's private namespace, so Surge reports
+#                 "completed" and the file is nowhere the user can see it.
+#   UMask       — it would change the mode of every downloaded file, and on a
+#                 0700 home world-readable downloads are already unreachable.
+#   MemoryDenyWriteExecute
+#               — media extraction runs yt-dlp, which runs a JavaScript engine
+#                 (deno) to solve YouTube's "n" challenge. A JIT needs
+#                 writable-executable memory: with this set deno panics,
+#                 yt-dlp reports "n challenge solving failed: Some formats may
+#                 be missing", and every progressive format disappears.
 NoNewPrivileges=true
 PrivateDevices=true
 ProtectSystem=full
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+
+# The directives that actually contain a process parsing attacker-controlled
+# bytes off the network. @system-service is the set stock user units use
+# (see /usr/lib/systemd/user/pipewire.service); @pkey is added because V8
+# (deno, via yt-dlp) allocates memory protection keys and @system-service
+# blocks pkey_alloc — the process is killed with SIGSYS without it.
+SystemCallFilter=@system-service @pkey
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=default.target

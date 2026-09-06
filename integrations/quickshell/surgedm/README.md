@@ -1,15 +1,25 @@
 # SurgeDM Quickshell integration
 
-This directory is both an Omarchy bar plugin and the package for the reusable
-Core Quickshell components.
+This directory is the Omarchy plugin. `manifest.json` plus `Panel.qml` are the
+whole plugin: `Panel.qml` is the single bar-widget entry point and is
+Omarchy-native, built from `qs.Ui` components and themed through `Style` and
+`Color`.
 
-For Omarchy, copy this directory to:
+Install it by copying this directory to:
 
     ~/.config/omarchy/plugins/io.github.surgedm.desktop
 
-For general Quickshell configurations, import Core/SurgeWidget.qml from your
-bar. The working standalone example is one directory above at shell.qml.
+`Core/` holds the reusable pieces, free of Omarchy imports:
+
+- `SurgeClient.qml` — asynchronous process client for the Surge CLI;
+- `SurgeModel.js` — pure parsing and formatting, no QML dependencies;
+- `SurgeWidget.qml` and `SurgePanelContent.qml` — a compact widget and panel
+  for generic Quickshell bars.
+
+A working standalone example is one directory up at `shell.qml`:
+
+    quickshell --path integrations/quickshell
 
 See docs/DESKTOP_INTEGRATION.md at the repository root for installation,
-configuration, authentication, troubleshooting, security, and removal
-instructions.
+configuration, interactions, authentication, troubleshooting, security, and
+removal instructions.

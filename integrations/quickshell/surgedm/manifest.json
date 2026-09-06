@@ -2,55 +2,78 @@
   "schemaVersion": 1,
   "id": "io.github.surgedm.desktop",
   "name": "SurgeDM",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "SurgeDM contributors",
   "license": "MIT",
   "homepage": "https://github.com/SurgeDM/Surge",
   "repository": "https://github.com/SurgeDM/Surge",
-  "description": "Monitor and control a local SurgeDM server from the Omarchy bar.",
+  "description": "Surge download status, controls, and user-service power switch in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "SurgeDM",
-    "description": "Download status and controls",
-    "category": "System",
+    "displayName": "Surge",
+    "description": "Download status, add downloads, and start or stop the Surge user service.",
+    "category": "Files",
     "allowMultiple": false,
-    "defaultSection": "right"
-  },
-  "settings": {
-    "command": {
-      "type": "string",
-      "default": "surge",
-      "description": "Surge executable name or absolute path"
+    "defaultSection": "right",
+    "defaults": {
+      "command": "surge",
+      "host": "",
+      "refreshIntervalSec": 2,
+      "downloadDirectory": "",
+      "serviceUnit": "surge.service",
+      "serviceControlsEnabled": true
     },
-    "host": {
-      "type": "string",
-      "default": "",
-      "description": "Optional host:port or URL; empty auto-detects the local server"
-    },
-    "pollInterval": {
-      "type": "integer",
-      "default": 2000,
-      "description": "Refresh interval in milliseconds (minimum 500)"
-    },
-    "downloadDirectory": {
-      "type": "string",
-      "default": "",
-      "description": "Optional output directory for downloads added from the widget"
-    },
-    "serviceUnit": {
-      "type": "string",
-      "default": "surge.service",
-      "description": "systemd user unit controlled by the Start and Stop buttons"
-    },
-    "serviceControlsEnabled": {
-      "type": "boolean",
-      "default": true,
-      "description": "Show controls for the systemd user service"
-    }
+    "schema": [
+      {
+        "key": "command",
+        "type": "string",
+        "label": "Surge executable",
+        "description": "Executable name on PATH, or an absolute path.",
+        "defaultValue": "surge"
+      },
+      {
+        "key": "host",
+        "type": "string",
+        "label": "Host",
+        "description": "host:port or URL. Empty auto-detects the local server.",
+        "defaultValue": ""
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often the widget polls Surge.",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 2
+      },
+      {
+        "key": "downloadDirectory",
+        "type": "string",
+        "label": "Download directory",
+        "description": "Absolute path for downloads added from the panel. Empty uses Surge's own default; a relative path is rejected.",
+        "defaultValue": ""
+      },
+      {
+        "key": "serviceUnit",
+        "type": "string",
+        "label": "systemd user unit",
+        "description": "Unit name the panel's power switch starts and stops, e.g. surge.service.",
+        "defaultValue": "surge.service"
+      },
+      {
+        "key": "serviceControlsEnabled",
+        "type": "boolean",
+        "label": "Show service controls",
+        "description": "Turn off for a manually managed or remote Surge server.",
+        "defaultValue": true
+      }
+    ]
   }
 }

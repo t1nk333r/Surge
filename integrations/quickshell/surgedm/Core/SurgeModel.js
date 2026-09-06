@@ -4,6 +4,31 @@ function safeString(value) {
   return String(value === undefined || value === null ? "" : value)
 }
 
+// Argument shapes the widget is willing to hand to the Surge CLI and to
+// systemctl. Both take these as positional operands, so a value starting with
+// `-` would be parsed as an option; callers also pass `--` before operands.
+var URL_PATTERN = /^https?:\/\/[^\s]+$/i
+var ID_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._:-]{0,127}$/
+var UNIT_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9:_.@\\-]{0,219}\.(service|socket|target|timer)$/
+
+function isDownloadUrl(value) {
+  return URL_PATTERN.test(safeString(value).trim())
+}
+
+// Ids come from the server's JSON, so they are untrusted input: an id of
+// `--clean` would turn a per-row delete into `surge rm --clean`.
+function isDownloadId(value) {
+  return ID_PATTERN.test(safeString(value))
+}
+
+function isServiceUnit(value) {
+  return UNIT_PATTERN.test(safeString(value).trim())
+}
+
+function isAbsolutePath(value) {
+  return safeString(value).trim().charAt(0) === "/"
+}
+
 function parseDownloads(raw) {
   var text = safeString(raw).trim()
   if (text === "") return []
@@ -11,7 +36,11 @@ function parseDownloads(raw) {
   var parsed = JSON.parse(text)
   if (!Array.isArray(parsed)) throw new Error("Surge returned a non-array download list")
 
-  return parsed.map(function(item) {
+  return parsed.filter(function(item) {
+    // A row whose id is not a usable operand cannot be paused, resumed or
+    // removed, so showing it would only offer broken buttons.
+    return item && isDownloadId(item.id)
+  }).map(function(item) {
     var progress = Number(item.progress)
     var speed = Number(item.speed)
     return {
@@ -104,6 +133,16 @@ function barLabel(available, loading, summary) {
   return "Surge ready"
 }
 
+// CLI diagnostics end up in the panel and in the always-visible bar tooltip,
+// so strip URL userinfo (a `host` setting may carry credentials) and cap the
+// length instead of pasting an arbitrary stderr line onto the bar.
+function firstMessageLine(combined) {
+  var line = safeString(combined).split("\n")[0].trim()
+  line = line.replace(/(\/\/)[^\/\s@]*@/g, "$1")
+  if (line.length > 160) line = line.slice(0, 159) + "…"
+  return line
+}
+
 function connectionError(exitCode, stderrText, stdoutText) {
   var combined = (safeString(stderrText) + "\n" + safeString(stdoutText)).trim()
   var lower = combined.toLowerCase()
@@ -117,13 +156,11 @@ function connectionError(exitCode, stderrText, stdoutText) {
     return "Surge is offline."
   if (exitCode === 0) return ""
 
-  var firstLine = combined.split("\n")[0]
-  return firstLine || "Could not connect to Surge."
+  return firstMessageLine(combined) || "Could not connect to Surge."
 }
 
 function actionError(exitCode, stderrText, stdoutText) {
   if (exitCode === 0) return ""
   var combined = (safeString(stderrText) + "\n" + safeString(stdoutText)).trim()
-  var firstLine = combined.split("\n")[0]
-  return firstLine || "The Surge action failed."
+  return firstMessageLine(combined) || "The Surge action failed."
 }

@@ -47,3 +47,5 @@ jobs:
           node-version: "22"
       - name: Model tests
         run: node integrations/quickshell/tests/model.test.js
+      - name: Manifest contract
+        run: node integrations/quickshell/tests/manifest.test.js
