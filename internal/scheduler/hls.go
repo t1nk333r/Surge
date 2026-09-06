@@ -277,7 +277,7 @@ func fetchFragments(
 	// towards the sample the size estimate is extrapolated from too, or the
 	// first fetched fragment would look like it carried all of them.
 	existing, existingCount := existingFragments(fragDir, len(fragments))
-	if existing > 0 {
+	if existingCount > 0 {
 		bytesGot.Store(existing)
 		accounted.Store(int64(existingCount))
 		if progState != nil {
@@ -323,7 +323,10 @@ func fetchFragments(
 					// With unknown fragment sizes the estimate can be beaten;
 					// never report more than the total, and grow the total
 					// once the estimate is clearly wrong.
-					if _, knownTotal, _, _, _, _ := progState.GetProgress(); knownTotal > 0 && total > knownTotal {
+					// count is 0 while another worker is between its byte
+					// publication and its increment, and a zero-length
+					// fragment contributes no bytes of its own.
+					if _, knownTotal, _, _, _, _ := progState.GetProgress(); count > 0 && knownTotal > 0 && total > knownTotal {
 						progState.SetTotalSize(total * int64(len(fragments)) / count)
 					}
 				}
@@ -462,8 +465,8 @@ func applyFragmentHeaders(req *http.Request, cfg *types.DownloadRecord, issuer s
 	}
 }
 
-// credentialHost is the host a download's headers belong to: the page the
-// media was extracted from when there is one, else the playlist's own host.
+// credentialHost is the host a download's headers belong to: the playlist the
+// media is served from when there is one, else the page it was extracted from.
 func credentialHost(cfg *types.DownloadRecord) string {
 	// The playlist's host, not the page's: yt-dlp resolves the playlist URL
 	// together with the headers, and media is usually served from a CDN host
@@ -495,7 +498,11 @@ func fragmentIdentity(cfg *types.DownloadRecord, fragments []hls.Segment) string
 	if stream == "" {
 		stream = cfg.ManifestURL
 	}
-	sum := sha256.Sum256([]byte(stream))
+	// The format id comes with the page: a re-resolve that picks a different
+	// rendition (a new variant published, a bandwidth tie broken the other
+	// way) must not inherit fragments of the old one, because renditions are
+	// segmented alike and would splice together without an error.
+	sum := sha256.Sum256([]byte(stream + "\x00" + cfg.FormatID))
 	return fmt.Sprintf("%x %d\n", sum[:16], len(fragments))
 }
 

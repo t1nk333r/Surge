@@ -102,6 +102,13 @@ func carryPartProgress(previous, refreshed []types.DownloadPart) []types.Downloa
 // (URL, DestPath) — swapping the URL without persisting it would lose the
 // resume map. Failure is not fatal: the existing URL may still be valid.
 func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
+	mgr.refreshExtractedURLBefore(cfg, time.Now().Add(resumeRefreshSlotWait))
+}
+
+// refreshExtractedURLBefore is refreshExtractedURL with an explicit deadline
+// for acquiring a probe slot, so a batch resume shares one wait instead of
+// paying it per download.
+func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord, slotDeadline time.Time) {
 	if cfg == nil || cfg.SourceURL == "" {
 		return
 	}
@@ -114,7 +121,7 @@ func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
 	// sending. Resuming ten items must not fork ten extractors at once, and
 	// must not queue behind ten timeouts either.
 	if mgr.probeSem != nil {
-		timer := time.NewTimer(resumeRefreshSlotWait)
+		timer := time.NewTimer(time.Until(slotDeadline))
 		defer timer.Stop()
 		select {
 		case <-mgr.probeSem:
@@ -259,6 +266,9 @@ func (mgr *LifecycleManager) Resume(id string) error {
 // ResumeBatch resumes multiple paused downloads efficiently.
 func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 	errs := make([]error, len(ids))
+	// One slot budget for the whole batch: ten downloads must not each wait
+	// their own five seconds before the first one is queued.
+	slotDeadline := time.Now().Add(resumeRefreshSlotWait)
 
 	if mgr.pool == nil {
 		for i := range errs {
@@ -292,7 +302,7 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 		// Try hot path first
 		if cfg := mgr.pool.ExtractPausedConfig(id); cfg != nil {
 			hydrateConfigFromDisk(cfg)
-			mgr.refreshExtractedURL(cfg)
+			mgr.refreshExtractedURLBefore(cfg, slotDeadline)
 			cfg.IsResume = true
 
 			if mgr.eventBus != nil {
@@ -353,7 +363,7 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 		}
 
 		cfg := buildResumeConfig(id, outputPath, entry, savedState, settings)
-		mgr.refreshExtractedURL(&cfg)
+		mgr.refreshExtractedURLBefore(&cfg, slotDeadline)
 
 		if mgr.eventBus != nil {
 			cfg.ProgressCh = mgr.eventBus.InputCh

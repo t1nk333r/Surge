@@ -557,6 +557,25 @@ func ReplaceURL(id string, newURL string) error {
 	masterMu.Lock()
 	defer masterMu.Unlock()
 
+	// The detail state carries its own copy of all of this, and both resume
+	// paths merge it back over the master entry, so clearing one store is
+	// clearing neither.
+	if baseDir != "" {
+		var ds DetailState
+		detailPath := getDetailPath(baseDir, id)
+		if err := loadGob(detailPath, &ds); err == nil && ds.State != nil {
+			ds.State.URL = newURL
+			ds.State.URLHash = URLHash(newURL)
+			ds.State.SourceURL = ""
+			ds.State.FormatID = ""
+			ds.State.ManifestURL = ""
+			ds.State.Parts = nil
+			if writeErr := atomicWrite(detailPath, ds); writeErr != nil {
+				return fmt.Errorf("failed to clear extraction state for %s: %w", id, writeErr)
+			}
+		}
+	}
+
 	list, err := loadMasterListUnlocked()
 	if err != nil {
 		return err

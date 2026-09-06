@@ -1439,17 +1439,22 @@ func TestReplaceURLDropsTheExtractionIdentity(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	id := uuid.New().String()
-	if err := AddToMasterList(types.DownloadRecord{
+	record := types.DownloadRecord{
 		ID:          id,
 		URL:         "https://site.example/watch",
+		DestPath:    filepath.Join(tempDir, "clip.mkv"),
 		SourceURL:   "https://site.example/watch",
 		FormatID:    "248+251",
 		ManifestURL: "https://cdn.example/master.m3u8",
 		Parts: []types.DownloadPart{
 			{URL: "https://cdn.example/v", Kind: types.PartKindVideo},
 		},
-	}); err != nil {
+	}
+	if err := AddToMasterList(record); err != nil {
 		t.Fatalf("seed record: %v", err)
+	}
+	if err := SaveStateWithOptions(record.URL, record.DestPath, &record, SaveStateOptions{SkipFileHash: true}); err != nil {
+		t.Fatalf("seed detail state: %v", err)
 	}
 
 	if err := ReplaceURL(id, "https://mirror.example/clip.mkv"); err != nil {
@@ -1468,6 +1473,21 @@ func TestReplaceURLDropsTheExtractionIdentity(t *testing.T) {
 	}
 	if got.SourceURL != "" || got.FormatID != "" || got.ManifestURL != "" || len(got.Parts) != 0 {
 		t.Errorf("extraction identity survived the replacement: %+v", got)
+	}
+
+	// The detail state is merged back over the master entry on both resume
+	// paths, so clearing one store is clearing neither.
+	saved, loadErr := LoadStates([]string{id})
+	if loadErr != nil {
+		t.Fatalf("LoadStates: %v", loadErr)
+	}
+	if detail := saved[id]; detail != nil {
+		if detail.ManifestURL != "" || detail.SourceURL != "" || len(detail.Parts) != 0 {
+			t.Errorf("detail state still carries the old identity: %+v", detail)
+		}
+		if detail.URL != "https://mirror.example/clip.mkv" {
+			t.Errorf("detail state URL = %q, want the replacement", detail.URL)
+		}
 	}
 
 	// A resolver-driven update keeps it: that URL came *from* the identity.
