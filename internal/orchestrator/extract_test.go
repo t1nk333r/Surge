@@ -246,3 +246,51 @@ func TestRefreshExtractedURLSkipsPlainDownloads(t *testing.T) {
 		t.Errorf("url = %q, must be untouched", cfg.URL)
 	}
 }
+
+// The probe semaphore is a pre-filled token pool: a slot is taken by
+// receiving. Sending instead looks like a working acquire but blocks on an
+// idle daemon - where every token is home and the channel is full - so the
+// resume-time re-resolve silently never ran and every extracted download
+// resumed into its expired URL.
+func TestRefreshExtractedURLTakesAProbeSlotOnAnIdleDaemon(t *testing.T) {
+	tmpDir := t.TempDir()
+	store.Configure(filepath.Join(tmpDir, "surge.db"))
+	t.Cleanup(func() { store.CloseDB() })
+
+	entry := types.DownloadRecord{
+		ID:        "id-idle",
+		URL:       "https://cdn.example/old.mp4?sig=expired",
+		DestPath:  filepath.Join(tmpDir, "clip.mp4"),
+		Status:    "paused",
+		SourceURL: "https://site.example/watch?v=1",
+	}
+	if err := store.AddToMasterList(entry); err != nil {
+		t.Fatalf("seed master list: %v", err)
+	}
+
+	ex := &fakeExtractor{
+		available: true,
+		media:     &extractor.Media{URL: "https://cdn.example/fresh.mp4?sig=valid"},
+	}
+
+	// Exactly how NewLifecycleManager builds it.
+	sem := make(chan struct{}, defaultMaxConcurrentProbes)
+	for range defaultMaxConcurrentProbes {
+		sem <- struct{}{}
+	}
+	mgr := &LifecycleManager{mediaExtractor: ex, probeSem: sem}
+
+	cfg := entry
+	mgr.refreshExtractedURL(&cfg)
+
+	if ex.calls != 1 {
+		t.Fatalf("extractor called %d times on an idle daemon, want 1", ex.calls)
+	}
+	if cfg.URL != "https://cdn.example/fresh.mp4?sig=valid" {
+		t.Errorf("URL = %q, want the refreshed one", cfg.URL)
+	}
+	if len(sem) != defaultMaxConcurrentProbes {
+		t.Errorf("probe pool holds %d tokens after the refresh, want %d",
+			len(sem), defaultMaxConcurrentProbes)
+	}
+}
