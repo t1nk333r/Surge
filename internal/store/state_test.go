@@ -1429,3 +1429,62 @@ func TestSetPartCompleteRecordsInMasterAndDetailState(t *testing.T) {
 		t.Errorf("SetPartComplete(out of range) = %v, want ErrNotFound", err)
 	}
 }
+
+// Replacing a download's URL is the user saying "that link is dead, use this
+// one". The stream list, playlist URL and page URL all described the media the
+// old link resolved to, and the engine dispatches on those before it looks at
+// the URL - so they must go with it, or the repair is a no-op.
+func TestReplaceURLDropsTheExtractionIdentity(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	id := uuid.New().String()
+	if err := AddToMasterList(types.DownloadRecord{
+		ID:          id,
+		URL:         "https://site.example/watch",
+		SourceURL:   "https://site.example/watch",
+		FormatID:    "248+251",
+		ManifestURL: "https://cdn.example/master.m3u8",
+		Parts: []types.DownloadPart{
+			{URL: "https://cdn.example/v", Kind: types.PartKindVideo},
+		},
+	}); err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	if err := ReplaceURL(id, "https://mirror.example/clip.mkv"); err != nil {
+		t.Fatalf("ReplaceURL: %v", err)
+	}
+
+	got, err := GetDownload(id)
+	if err != nil || got == nil {
+		t.Fatalf("GetDownload: %v", err)
+	}
+	if got.URL != "https://mirror.example/clip.mkv" {
+		t.Errorf("URL = %q, want the replacement", got.URL)
+	}
+	if got.URLHash != URLHash("https://mirror.example/clip.mkv") {
+		t.Error("URLHash was not recomputed for the new URL")
+	}
+	if got.SourceURL != "" || got.FormatID != "" || got.ManifestURL != "" || len(got.Parts) != 0 {
+		t.Errorf("extraction identity survived the replacement: %+v", got)
+	}
+
+	// A resolver-driven update keeps it: that URL came *from* the identity.
+	if err := AddToMasterList(types.DownloadRecord{
+		ID: id, URL: got.URL, SourceURL: "https://site.example/watch",
+		ManifestURL: "https://cdn.example/new.m3u8",
+	}); err != nil {
+		t.Fatalf("re-seed: %v", err)
+	}
+	if err := UpdateURL(id, "https://cdn.example/refreshed.m3u8"); err != nil {
+		t.Fatalf("UpdateURL: %v", err)
+	}
+	after, err := GetDownload(id)
+	if err != nil || after == nil {
+		t.Fatalf("GetDownload after UpdateURL: %v", err)
+	}
+	if after.SourceURL == "" || after.ManifestURL == "" {
+		t.Errorf("a resolved-URL update dropped the identity: %+v", after)
+	}
+}

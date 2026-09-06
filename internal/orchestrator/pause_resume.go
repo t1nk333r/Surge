@@ -68,11 +68,6 @@ func hydrateConfigFromDisk(cfg *types.DownloadRecord) {
 	if len(saved.Parts) > 0 {
 		cfg.Parts = carryPartProgress(cfg.Parts, saved.Parts)
 	}
-	// When the pause happened decides whether an extracted URL needs
-	// re-resolving before the download restarts.
-	if saved.PausedAt > 0 {
-		cfg.PausedAt = saved.PausedAt
-	}
 }
 
 // carryPartProgress copies the completion flags of the previous part list onto
@@ -114,24 +109,20 @@ func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
 	if ex == nil || !ex.Available() {
 		return
 	}
-	if cfg.PausedAt > 0 && time.Since(time.Unix(cfg.PausedAt, 0)) < resumeRefreshGrace {
-		// The URL was still working moments ago. Re-resolving it would fork a
-		// process and hold the caller - the API request or a keypress - for
-		// nothing.
-		return
-	}
-
-	// A resume waits for this, so it gets a short budget and the same
-	// concurrency cap as probing: resuming ten items must not fork ten
-	// extractors nor block for ten timeouts.
+	// A resume waits for this, so it gets a short budget and a probe slot: the
+	// pool is pre-filled, so a slot is taken by receiving and returned by
+	// sending. Resuming ten items must not fork ten extractors at once, and
+	// must not queue behind ten timeouts either.
 	if mgr.probeSem != nil {
+		timer := time.NewTimer(resumeRefreshSlotWait)
+		defer timer.Stop()
 		select {
-		case mgr.probeSem <- struct{}{}:
-			defer func() { <-mgr.probeSem }()
-		default:
-			// Probing is saturated; a stale URL still gets one attempt from
-			// the engine, and UpdateURL repairs it on the next resume.
-			utils.Debug("Resume: skipping URL refresh for %s: extraction slots busy", cfg.ID)
+		case <-mgr.probeSem:
+			defer func() { mgr.probeSem <- struct{}{} }()
+		case <-timer.C:
+			// Probing is saturated. The existing URL still gets its attempt,
+			// and a failed download can be resumed again.
+			utils.Debug("Resume: skipping URL refresh for %s: no probe slot", cfg.ID)
 			return
 		}
 	}
@@ -176,7 +167,7 @@ func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
 	if media.URL == cfg.URL {
 		return
 	}
-	if err := mgr.UpdateURL(cfg.ID, media.URL); err != nil {
+	if err := mgr.persistResolvedURL(cfg.ID, media.URL); err != nil {
 		utils.Debug("Resume: could not persist refreshed URL for %s: %v", cfg.ID, err)
 		return
 	}
@@ -436,17 +427,32 @@ func (mgr *LifecycleManager) Cancel(id string) error {
 	return nil
 }
 
-// UpdateURL updates the URL of a download in both the pool (in-memory) and the DB.
+// UpdateURL replaces a download's URL on the user's instruction, in both the
+// pool (in-memory) and the DB. This is the "the link died, here is a new one"
+// path, so the record's extraction identity goes with the old URL: the stream
+// list, the playlist URL and the page they came from all described the media
+// the user is replacing.
 func (mgr *LifecycleManager) UpdateURL(id string, newURL string) error {
 	// Update in-memory state via pool (validates download state too)
 	if mgr.pool != nil {
 		if err := mgr.pool.UpdateURL(id, newURL); err != nil {
 			return err
 		}
-		// Pool update succeeded; persist to DB.
-		return store.UpdateURL(id, newURL)
+		if err := mgr.pool.ClearExtractionIdentity(id); err != nil {
+			utils.Debug("UpdateURL: could not clear extraction state for %s: %v", id, err)
+		}
 	}
-	// No pool connected - DB-only update is correct (no in-memory state to sync).
+	return store.ReplaceURL(id, newURL)
+}
+
+// persistResolvedURL records a URL Surge resolved itself, keeping the
+// extraction identity that produced it.
+func (mgr *LifecycleManager) persistResolvedURL(id string, newURL string) error {
+	if mgr.pool != nil {
+		if err := mgr.pool.UpdateURL(id, newURL); err != nil {
+			return err
+		}
+	}
 	return store.UpdateURL(id, newURL)
 }
 
@@ -457,7 +463,6 @@ func (mgr *LifecycleManager) UpdateURL(id string, newURL string) error {
 func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, savedState *types.DownloadRecord, settings *config.Settings) types.DownloadRecord {
 	var destPath, url, filename string
 	var sourceURL, formatID, manifestURL string
-	var pausedAt int64
 	var parts []types.DownloadPart
 	var totalSize, downloaded int64
 	var rateLimit int64
@@ -496,11 +501,6 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 	}
 	if len(parts) == 0 && savedState != nil {
 		parts = savedState.Parts
-	}
-	// The pause timestamp only exists on the persisted snapshot; it decides
-	// whether an extracted URL is stale enough to need re-resolving.
-	if savedState != nil {
-		pausedAt = savedState.PausedAt
 	}
 	if manifestURL == "" && savedState != nil {
 		manifestURL = savedState.ManifestURL
@@ -571,7 +571,6 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		FormatID:        formatID,
 		Parts:           parts,
 		ManifestURL:     manifestURL,
-		PausedAt:        pausedAt,
 		TotalSize:       totalSize,
 		SupportsRange:   savedState != nil && len(savedState.Tasks) > 0,
 		IsResume:        true,

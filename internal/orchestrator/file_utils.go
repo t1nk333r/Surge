@@ -222,12 +222,23 @@ func RemoveIncompleteFile(destPath string) error {
 		drop(err)
 	}
 
-	// Stream working files: the record is not available here, and the kind is
-	// part of the name, so match on the shape the engine writes.
-	parts, globErr := filepath.Glob(destPath + ".p[0-9]*.*" + types.IncompleteSuffix)
-	if globErr == nil {
-		for _, part := range parts {
-			drop(retryRemove(part))
+	// Stream working files: the record is not available here and the stream
+	// kind is part of the name, so the directory is scanned and the names are
+	// compared literally. A glob would read "[", "]" and "*" in the user's own
+	// filename as pattern syntax, which both misses its own files and matches
+	// a neighbour's.
+	prefix := filepath.Base(destPath) + ".p"
+	if entries, readErr := os.ReadDir(filepath.Dir(destPath)); readErr == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, types.IncompleteSuffix) {
+				continue
+			}
+			// ".p" must be followed by the stream index.
+			if rest := name[len(prefix):]; rest == "" || rest[0] < '0' || rest[0] > '9' {
+				continue
+			}
+			drop(retryRemove(filepath.Join(filepath.Dir(destPath), name)))
 		}
 	}
 

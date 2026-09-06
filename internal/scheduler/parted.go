@@ -173,11 +173,13 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 		if info, statErr := os.Stat(workingPath); statErr == nil {
 			onDisk = info.Size()
 		}
-		if part.Complete && onDisk > 0 && (part.Size <= 0 || onDisk >= part.Size) {
-			size := part.Size
-			if size <= 0 {
-				size = onDisk
-			}
+		// The size is not a completion threshold: the extractor's figure is
+		// often `filesize_approx`, a bitrate estimate that differs from the
+		// real body by a few percent, so comparing against it would
+		// re-download streams that are genuinely finished. What is on disk is
+		// the truth about how much was fetched.
+		if part.Complete && onDisk > 0 {
+			size := onDisk
 			utils.Debug("Part %d (%s) already downloaded, skipping", i, part.Kind)
 			completedBytes += size
 			if progState != nil {
@@ -187,8 +189,8 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 			continue
 		}
 		if part.Complete {
-			utils.Debug("Part %d (%s) was recorded complete but holds %d of %d bytes; downloading it again",
-				i, part.Kind, onDisk, part.Size)
+			utils.Debug("Part %d (%s) was recorded complete but its file is missing or empty; downloading it again",
+				i, part.Kind)
 		}
 
 		// The downloaders require the working file to exist already; for a

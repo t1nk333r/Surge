@@ -84,9 +84,9 @@ const (
 	// resumeRefreshTimeout caps the re-resolve a resume waits for. A known
 	// page resolves in seconds; a resume must not hang on a slow one.
 	resumeRefreshTimeout = 30 * time.Second
-	// resumeRefreshGrace is how long an extracted URL is assumed to still
-	// work after a pause, so the common pause-and-resume costs nothing.
-	resumeRefreshGrace = 2 * time.Minute
+	// resumeRefreshSlotWait is how long a resume waits for a probe slot before
+	// giving up on refreshing the URL and letting the engine try what it has.
+	resumeRefreshSlotWait = 5 * time.Second
 )
 
 var reserveWorkingFile = precreateWorkingFile
@@ -543,17 +543,9 @@ func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequ
 		return false, nil
 	}
 
-	// Extraction forks a process that holds a network connection, so it obeys
-	// the same concurrency cap as probing: a batch of unreachable URLs must
-	// not fork one yt-dlp per URL at once.
-	if mgr.probeSem != nil {
-		select {
-		case mgr.probeSem <- struct{}{}:
-			defer func() { <-mgr.probeSem }()
-		case <-ctx.Done():
-			return false, fmt.Errorf("extraction aborted before starting: %w", ctx.Err())
-		}
-	}
+	// No semaphore here: enqueueNew already holds a probe slot for this
+	// request, so extraction inherits the probe concurrency cap, and taking a
+	// second slot would deadlock a daemon configured with one.
 
 	extractCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

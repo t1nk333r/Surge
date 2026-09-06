@@ -203,7 +203,10 @@ func TestRunManifestDownloadDiscardsAnotherStreamsFragments(t *testing.T) {
 	cfg := manifestRecord(t, dir, "stream.mp4", server.URL+"/master.m3u8")
 
 	fragDir := types.FragmentDirPath(cfg.DestPath)
+	// A different stream that happened to be saved under this name: another
+	// page, so another identity.
 	stale := manifestRecord(t, dir, "other.mp4", "https://elsewhere.example/other.m3u8")
+	stale.SourceURL = "https://elsewhere.example/watch?v=2"
 	if err := prepareFragmentDir(fragDir, fragmentIdentity(stale, []hls.Segment{{}, {}})); err != nil {
 		t.Fatalf("prepare fragment dir: %v", err)
 	}
@@ -221,6 +224,35 @@ func TestRunManifestDownloadDiscardsAnotherStreamsFragments(t *testing.T) {
 	}
 	if want := string(fragments[0]) + string(fragments[1]); string(got) != want {
 		t.Errorf("assembled %q, want %q - stale fragments were reused", got, want)
+	}
+}
+
+// Resuming re-resolves the page, which hands back a freshly signed playlist
+// URL. The fragments on disk are the same stream, so they must survive: keying
+// their identity on the playlist URL would silently re-download everything.
+func TestRunManifestDownloadKeepsFragmentsAcrossARefreshedPlaylistURL(t *testing.T) {
+	fragments := [][]byte{[]byte("one"), []byte("two")}
+	server := newHLSServer(t, fragments)
+
+	dir := t.TempDir()
+	withMuxer(t, &recordingMuxer{available: true})
+
+	first := manifestRecord(t, dir, "stream.mp4", server.URL+"/master.m3u8?sig=first")
+	fragDir := types.FragmentDirPath(first.DestPath)
+	if err := prepareFragmentDir(fragDir, fragmentIdentity(first, []hls.Segment{{}, {}})); err != nil {
+		t.Fatalf("prepare fragment dir: %v", err)
+	}
+	if err := os.WriteFile(fragmentPath(fragDir, 0), fragments[0], 0o644); err != nil {
+		t.Fatalf("seed fragment: %v", err)
+	}
+
+	// Same page, re-signed playlist URL.
+	resumed := manifestRecord(t, dir, "stream.mp4", server.URL+"/master.m3u8?sig=second")
+	if _, err := runManifestDownload(context.Background(), resumed, progress.CfgProgress(resumed), resumed.DestPath); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hits := server.fragmentHits.Load(); hits != 1 {
+		t.Errorf("fetched %d fragments after the refresh, want only the missing one", hits)
 	}
 }
 

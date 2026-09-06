@@ -307,7 +307,14 @@ func fetchFragments(
 				}
 
 				total := bytesGot.Add(written)
-				count := accounted.Add(1)
+				// A fragment already on disk was counted by the seed above;
+				// counting it again would extrapolate the total from more
+				// fragments than the bytes represent, publishing a total below
+				// what is downloaded.
+				count := accounted.Load()
+				if written > 0 {
+					count = accounted.Add(1)
+				}
 				if progState != nil {
 					// Two workers can finish out of order; the byte count a
 					// user watches must never tick backwards.
@@ -458,7 +465,11 @@ func applyFragmentHeaders(req *http.Request, cfg *types.DownloadRecord, issuer s
 // credentialHost is the host a download's headers belong to: the page the
 // media was extracted from when there is one, else the playlist's own host.
 func credentialHost(cfg *types.DownloadRecord) string {
-	for _, candidate := range []string{cfg.SourceURL, cfg.ManifestURL} {
+	// The playlist's host, not the page's: yt-dlp resolves the playlist URL
+	// together with the headers, and media is usually served from a CDN host
+	// that is not the page host. Stripping credentials there would fail the
+	// very first request on any site that needs them.
+	for _, candidate := range []string{cfg.ManifestURL, cfg.SourceURL} {
 		if candidate == "" {
 			continue
 		}
@@ -476,7 +487,15 @@ func fragmentPath(fragDir string, index int) string {
 // fragmentIdentity is what makes a fragment directory belong to one stream:
 // the playlist it was built from and how many fragments that playlist had.
 func fragmentIdentity(cfg *types.DownloadRecord, fragments []hls.Segment) string {
-	sum := sha256.Sum256([]byte(cfg.ManifestURL))
+	// Not the playlist URL: it is re-signed on every resume, so hashing it
+	// would discard the fragments of every paused download. The page the
+	// stream was extracted from is the durable identity; a directly pasted
+	// playlist has no page, and its URL is what the user typed.
+	stream := cfg.SourceURL
+	if stream == "" {
+		stream = cfg.ManifestURL
+	}
+	sum := sha256.Sum256([]byte(stream))
 	return fmt.Sprintf("%x %d\n", sum[:16], len(fragments))
 }
 

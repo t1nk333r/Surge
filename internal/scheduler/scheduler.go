@@ -597,6 +597,25 @@ func (p *Scheduler) UpdateURL(downloadID string, newURL string) error {
 	return nil
 }
 
+// ClearExtractionIdentity drops the media provenance of an in-memory download
+// after its URL was replaced by the user: the stream list and playlist URL
+// describe the media the old URL resolved to, and the engine dispatches on
+// them before it looks at the URL.
+func (p *Scheduler) ClearExtractionIdentity(downloadID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ad, exists := p.downloads[downloadID]
+	if !exists || ad == nil {
+		return nil
+	}
+	ad.config.SourceURL = ""
+	ad.config.FormatID = ""
+	ad.config.ManifestURL = ""
+	ad.config.Parts = nil
+	return nil
+}
+
 func (p *Scheduler) waitForTask() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -548,6 +548,34 @@ func UpdateURL(id string, newURL string) error {
 	return saveMasterListLocked(list)
 }
 
+// ReplaceURL sets a download's URL on the user's explicit instruction and
+// drops its extraction identity with it. A stream list or playlist URL
+// describes the media the *old* URL resolved to; keeping either would send
+// the engine back to the streams the user is trying to replace, and the page
+// URL would re-resolve to them on the next resume.
+func ReplaceURL(id string, newURL string) error {
+	masterMu.Lock()
+	defer masterMu.Unlock()
+
+	list, err := loadMasterListUnlocked()
+	if err != nil {
+		return err
+	}
+	for i, e := range list.Downloads {
+		if e.ID != id {
+			continue
+		}
+		list.Downloads[i].URL = newURL
+		list.Downloads[i].URLHash = URLHash(newURL)
+		list.Downloads[i].SourceURL = ""
+		list.Downloads[i].FormatID = ""
+		list.Downloads[i].ManifestURL = ""
+		list.Downloads[i].Parts = nil
+		return saveMasterListLocked(list)
+	}
+	return fmt.Errorf("%w: %s", types.ErrNotFound, id)
+}
+
 // SetPartComplete records that one stream of a multi-part download has been
 // fetched in full, in both the master list and the detail state, so a resume
 // from either path skips it instead of downloading it twice.
