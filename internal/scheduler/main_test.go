@@ -2,27 +2,16 @@
 package scheduler
 
 import (
-	"fmt"
-	"net/http"
 	"os"
 	"testing"
 
-	"github.com/SurgeDM/Surge/internal/transport"
+	"github.com/SurgeDM/Surge/internal/testutil"
 	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
-	code := m.Run()
-	http.DefaultClient.CloseIdleConnections()
-	transport.DefaultNetworkPool.CloseAll()
-	if code == 0 {
-		if err := goleak.Find(
-			goleak.IgnoreTopFunction("sync.runtime_notifyListWait"),
-			goleak.IgnoreTopFunction("github.com/SurgeDM/Surge/internal/scheduler.safeSendProgress"),
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "goleak: Errors on successful test run: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	os.Exit(code)
+	os.Exit(testutil.CheckLeaks(m.Run(),
+		goleak.IgnoreTopFunction("sync.runtime_notifyListWait"),
+		goleak.IgnoreTopFunction("github.com/SurgeDM/Surge/internal/scheduler.safeSendProgress"),
+	))
 }
