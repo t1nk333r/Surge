@@ -10,10 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SurgeDM/Surge/internal/probe"
 	"github.com/SurgeDM/Surge/internal/progress"
-	"github.com/SurgeDM/Surge/internal/strategy/concurrent"
-	"github.com/SurgeDM/Surge/internal/strategy/single"
 	"github.com/SurgeDM/Surge/internal/types"
 	"github.com/SurgeDM/Surge/internal/utils"
 )
@@ -176,90 +173,36 @@ func RunDownload(ctx context.Context, cfg *types.DownloadRecord) error {
 		}
 	}
 
-	// Choose downloader based on probe results
+	// Three shapes of download: a fragmented stream assembled from a playlist,
+	// separate video and audio streams that are muxed, or one plain HTTP file.
 	var downloadErr error
-	useConcurrent := cfg.SupportsRange
-
-	if useConcurrent {
-		utils.Debug("Using concurrent downloader")
-
-		// We probe all candidate mirrors (mirrors) to filter out invalid ones
-		var activeMirrors []string
-		if len(mirrors) > 0 {
-			utils.Debug("Probing %d mirrors", len(mirrors))
-			// Always check primary + mirrors to ensure we are using the best set
-			allToCheck := append([]string{cfg.URL}, mirrors...)
-			runCfg := &types.RuntimeConfig{
-				ProxyURL:  cfg.Runtime.ProxyURL,
-				CustomDNS: cfg.Runtime.CustomDNS,
-			}
-			valid, errs := probe.ProbeMirrorsWithProxy(ctx, allToCheck, runCfg)
-
-			// Log errors
-			for u, e := range errs {
-				utils.Debug("Mirror probe failed for %s: %v", u, e)
-			}
-
-			// Filter valid mirrors (excluding primary as it is handled separately)
-			for _, v := range valid {
-				if v != cfg.URL {
-					activeMirrors = append(activeMirrors, v)
-				}
-			}
-			utils.Debug("Found %d active mirrors from %d candidates", len(activeMirrors), len(mirrors))
+	switch {
+	case cfg.ManifestURL != "":
+		// A fragmented stream (HLS): many requests, one file.
+		var manifestSize int64
+		manifestSize, downloadErr = runManifestDownload(ctx, cfg, progState, finalDestPath)
+		if manifestSize > 0 {
+			effectiveTotalSize = manifestSize
 		}
-
-		d := concurrent.NewConcurrentDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
-		d.Headers = cfg.Headers // Forward custom headers from browser extension
-		d.Limiter = cfg.Limiter
-		d.RateLimitBps = cfg.RateLimit
-		d.RateLimitSet = cfg.RateLimitSet
-		utils.Debug("Calling Download with mirrors: %v", mirrors)
-		// Pass effectiveTotalSize to avoid unnecessary bootstrap if state already knows the size
-		downloadErr = d.Download(ctx, cfg.URL, mirrors, activeMirrors, finalDestPath, effectiveTotalSize)
-		if d.TotalSize > 0 {
-			effectiveTotalSize = d.TotalSize
+	case len(cfg.Parts) > 0:
+		var partedSize int64
+		partedSize, downloadErr = runPartedDownload(ctx, cfg, progState, finalDestPath)
+		if partedSize > 0 {
+			effectiveTotalSize = partedSize
 		}
-
-		var downloaded int64
-		if progState != nil {
-			downloaded = progState.Bytes.Downloaded.Load()
-		}
-
-		// Determine if we should attempt a fallback to single-threaded mode.
-		// We fallback if concurrent failed, but it wasn't a clean pause or external cancellation,
-		// AND we haven't made any progress yet (to avoid discarding progress).
-		if shouldFallbackToSingle(downloadErr, downloaded) {
-			utils.Debug("Concurrent download failed: %v - falling back to single-threaded", downloadErr)
-			useConcurrent = false // Trigger sequential block below
-
-			// Reset progress state cleanly for single-stream restart from byte 0
-			if progState != nil {
-				progState.SessionReset()
-			}
-
-			// Truncate the working file to zero to prevent stale tail bytes
-			// from the failed concurrent session.
-			surgePath := finalDestPath + types.IncompleteSuffix
-			_ = os.Truncate(surgePath, 0)
-		}
-	}
-
-	if !useConcurrent {
-		// Fallback to single-threaded downloader
-		utils.Debug("Using single-threaded downloader")
-		d := single.NewSingleDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
-		d.Headers = cfg.Headers // Forward custom headers from browser extension
-		d.Limiter = cfg.Limiter
-		// Pass effectiveTotalSize here as well
-		downloadErr = d.Download(ctx, cfg.URL, finalDestPath, effectiveTotalSize, finalFilename)
-		if d.TotalSize > 0 {
-			effectiveTotalSize = d.TotalSize
-		}
-		if downloadErr != nil {
-			utils.Debug("Single-threaded download failed: %v", downloadErr)
-		} else {
-			utils.Debug("Single-threaded download completed: %d bytes", effectiveTotalSize)
+	default:
+		var size int64
+		size, downloadErr = acquireStream(ctx, cfg, progState, streamSpec{
+			url:           cfg.URL,
+			headers:       cfg.Headers,
+			destPath:      finalDestPath,
+			filename:      finalFilename,
+			totalSize:     effectiveTotalSize,
+			supportsRange: cfg.SupportsRange,
+			mirrors:       mirrors,
+		})
+		if size > 0 {
+			effectiveTotalSize = size
 		}
 	}
 

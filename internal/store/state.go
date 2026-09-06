@@ -526,6 +526,52 @@ func UpdateURL(id string, newURL string) error {
 	return saveMasterListLocked(list)
 }
 
+// SetPartComplete records that one stream of a multi-part download has been
+// fetched in full, in both the master list and the detail state, so a resume
+// from either path skips it instead of downloading it twice.
+func SetPartComplete(id string, index int) error {
+	masterMu.Lock()
+	defer masterMu.Unlock()
+
+	list, err := loadMasterListUnlocked()
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for i := range list.Downloads {
+		if list.Downloads[i].ID != id {
+			continue
+		}
+		if index < 0 || index >= len(list.Downloads[i].Parts) {
+			return fmt.Errorf("%w: part %d of %s", types.ErrNotFound, index, id)
+		}
+		list.Downloads[i].Parts[index].Complete = true
+		found = true
+		break
+	}
+	if !found {
+		return fmt.Errorf("%w: %s", types.ErrNotFound, id)
+	}
+
+	// The detail state is what a hot-path resume hydrates from; keep the two
+	// in step so neither can claim a finished part is still pending.
+	dir := baseDir
+	if dir != "" {
+		var ds DetailState
+		detailPath := getDetailPath(dir, id)
+		if err := loadGob(detailPath, &ds); err == nil && ds.State != nil &&
+			index >= 0 && index < len(ds.State.Parts) {
+			ds.State.Parts[index].Complete = true
+			if writeErr := atomicWrite(detailPath, ds); writeErr != nil {
+				utils.Debug("SetPartComplete: could not update detail state for %s: %v", id, writeErr)
+			}
+		}
+	}
+
+	return saveMasterListLocked(list)
+}
+
 func PauseAllDownloads() error {
 	masterMu.Lock()
 	defer masterMu.Unlock()
@@ -725,6 +771,13 @@ func ValidateIntegrity() (int, error) {
 		candidateDirs[filepath.Dir(e.DestPath)] = struct{}{}
 		if e.Status != "completed" {
 			expectedSurgePaths[e.DestPath+types.IncompleteSuffix] = struct{}{}
+			// A multi-part download keeps one working file per stream next to
+			// the final file. They are not orphans, and deleting them would
+			// throw away everything downloaded so far.
+			for i, part := range e.Parts {
+				partPath := types.PartWorkingPath(e.DestPath, i, part.Kind) + types.IncompleteSuffix
+				expectedSurgePaths[partPath] = struct{}{}
+			}
 		}
 
 		if e.Status == "paused" || e.Status == "queued" {

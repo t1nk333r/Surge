@@ -68,6 +68,29 @@ type DownloadRecord struct {
 	Workers      int      `json:"workers,omitempty"`
 	MinChunkSize int64    `json:"min_chunk_size,omitempty"`
 
+	// Media Extraction (Persistent)
+	//
+	// SourceURL is the page URL a media URL was extracted from. Extracted URLs
+	// are signed and short-lived, so re-resolving SourceURL is the only way to
+	// resume such a download later. FormatID names the chosen format.
+	// Request headers are deliberately NOT persisted: they can carry
+	// credentials, and a fresh media URL needs freshly resolved headers anyway.
+	SourceURL string `json:"source_url,omitempty"`
+	FormatID  string `json:"format_id,omitempty"`
+
+	// Parts is non-empty for media that only exists as separate streams (a
+	// video track plus an audio track). The engine downloads each part into
+	// its own working file and muxes them into DestPath. Part headers are
+	// transient for the same reason record headers are: they can carry
+	// credentials, and a re-resolved URL needs re-resolved headers.
+	Parts []DownloadPart `json:"parts,omitempty"`
+
+	// ManifestURL is set for a fragmented stream (HLS): the engine reads the
+	// playlist, downloads every fragment and assembles them into DestPath.
+	// Like a part URL it is signed and short-lived, so SourceURL is what makes
+	// such a download resumable.
+	ManifestURL string `json:"manifest_url,omitempty"`
+
 	// Runtime / Transient Configuration (Not persisted)
 	IsResume           bool                 `json:"-" gob:"-"`
 	ProgressCh         chan<- DownloadEvent `json:"-" gob:"-"`
@@ -77,6 +100,39 @@ type DownloadRecord struct {
 	Limiter            ByteLimiter          `json:"-" gob:"-"`
 	IsExplicitCategory bool                 `json:"-" gob:"-"`
 	SupportsRange      bool                 `json:"-" gob:"-"`
+}
+
+// DownloadPart is one stream of a multi-part download.
+type DownloadPart struct {
+	URL      string            `json:"url"`
+	FormatID string            `json:"format_id,omitempty"`
+	Kind     string            `json:"kind"`
+	Size     int64             `json:"size,omitempty"`
+	Headers  map[string]string `json:"-" gob:"-"`
+
+	// Complete is set once the stream has been fetched in full. A part's
+	// working file cannot be judged by its size, because the concurrent
+	// downloader preallocates it, so completion is recorded explicitly and
+	// persisted: a resumed multi-part download re-runs only what is missing.
+	Complete bool `json:"complete,omitempty"`
+}
+
+// Part kinds. A multi-part download carries exactly one of each.
+const (
+	PartKindVideo = "video"
+	PartKindAudio = "audio"
+)
+
+// PartWorkingPath is the path a multi-part download uses for one stream. The
+// downloaders append IncompleteSuffix themselves, so the file on disk is
+// "<final>.p0.video.surge" next to the final file. Both the engine (which
+// writes them) and the store's integrity sweep (which must not delete them)
+// derive the name from here.
+func PartWorkingPath(destPath string, index int, kind string) string {
+	if kind == "" {
+		kind = fmt.Sprintf("part%d", index)
+	}
+	return fmt.Sprintf("%s.p%d.%s", destPath, index, kind)
 }
 
 // MasterList holds all tracked downloads.

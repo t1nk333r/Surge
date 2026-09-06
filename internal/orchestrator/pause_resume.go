@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"time"
 
 	"github.com/SurgeDM/Surge/internal/config"
@@ -62,6 +63,99 @@ func hydrateConfigFromDisk(cfg *types.DownloadRecord) {
 		cfg.ChunkBitmap = saved.ChunkBitmap
 		cfg.ActualChunkSize = saved.ActualChunkSize
 	}
+	// The engine records finished streams in the store, so the persisted part
+	// list is more current than whatever the pool is still holding.
+	if len(saved.Parts) > 0 {
+		cfg.Parts = carryPartProgress(cfg.Parts, saved.Parts)
+	}
+}
+
+// carryPartProgress copies the completion flags of the previous part list onto
+// a freshly resolved one. Re-resolving hands back new signed URLs for the same
+// streams; forgetting that a stream is already downloaded would fetch it twice.
+func carryPartProgress(previous, refreshed []types.DownloadPart) []types.DownloadPart {
+	if len(previous) == 0 {
+		return refreshed
+	}
+	byKind := make(map[string]types.DownloadPart, len(previous))
+	for _, part := range previous {
+		byKind[part.Kind] = part
+	}
+	for i := range refreshed {
+		if old, ok := byKind[refreshed[i].Kind]; ok && old.Complete {
+			refreshed[i].Complete = true
+			// Keep the URL that produced the finished file: nothing will be
+			// requested with it, and it keeps the record self-consistent.
+			refreshed[i].URL = old.URL
+		}
+	}
+	return refreshed
+}
+
+// refreshExtractedURL re-resolves a download whose URL came from a media
+// extractor. Those URLs are signed and short-lived, so a download paused for
+// long enough would resume straight into a 403; the page URL is the only
+// durable handle on the media.
+//
+// The resolved URL is written through UpdateURL (pool + store) before the
+// download is re-queued, because saved chunk state is looked up by
+// (URL, DestPath) — swapping the URL without persisting it would lose the
+// resume map. Failure is not fatal: the existing URL may still be valid.
+func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
+	if cfg == nil || cfg.SourceURL == "" {
+		return
+	}
+	ex := mgr.mediaExtractor
+	if ex == nil || !ex.Available() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), mediaExtractionTimeout)
+	defer cancel()
+
+	media, err := ex.Resolve(ctx, cfg.SourceURL, mgr.extractorOptions())
+	if err != nil || media == nil || media.URL == "" {
+		utils.Debug("Resume: %s could not re-resolve %s: %v", ex.Name(), cfg.SourceURL, err)
+		return
+	}
+
+	cfg.FormatID = media.FormatID
+
+	if len(media.Parts) > 0 {
+		// Multi-part media keeps the page URL as its identity, so nothing has
+		// to be persisted here: only the per-part URLs and headers expire, and
+		// those are transient by design. What must survive is which streams
+		// are already on disk.
+		refreshed, _ := convertParts(media.Parts)
+		cfg.Parts = carryPartProgress(cfg.Parts, refreshed)
+		cfg.Headers = nil
+		utils.Debug("Resume: refreshed %d media parts for %s", len(cfg.Parts), cfg.ID)
+		return
+	}
+
+	if media.ManifestURL != "" {
+		// A fragmented stream keeps the page URL as its identity too; the
+		// playlist URL is transient and the fragments already on disk are
+		// keyed by index, so a refreshed playlist resumes where it stopped as
+		// long as the stream itself has not changed.
+		cfg.ManifestURL = media.ManifestURL
+		cfg.Headers = media.Headers
+		cfg.Parts = nil
+		utils.Debug("Resume: refreshed playlist URL for %s", cfg.ID)
+		return
+	}
+
+	cfg.Headers = media.Headers
+	cfg.Parts = nil
+	if media.URL == cfg.URL {
+		return
+	}
+	if err := mgr.UpdateURL(cfg.ID, media.URL); err != nil {
+		utils.Debug("Resume: could not persist refreshed URL for %s: %v", cfg.ID, err)
+		return
+	}
+	cfg.URL = media.URL
+	utils.Debug("Resume: refreshed media URL for %s from %s", cfg.ID, cfg.SourceURL)
 }
 
 // Resume resumes a paused download.
@@ -86,6 +180,7 @@ func (mgr *LifecycleManager) Resume(id string) error {
 	// Hot path: pool still holds the paused download in memory.
 	if cfg := mgr.pool.ExtractPausedConfig(id); cfg != nil {
 		hydrateConfigFromDisk(cfg)
+		mgr.refreshExtractedURL(cfg)
 		cfg.IsResume = true
 
 		if mgr.eventBus != nil {
@@ -127,6 +222,7 @@ func (mgr *LifecycleManager) Resume(id string) error {
 	}
 
 	cfg := buildResumeConfig(id, outputPath, entry, savedState, settings)
+	mgr.refreshExtractedURL(&cfg)
 
 	if mgr.eventBus != nil {
 		cfg.ProgressCh = mgr.eventBus.InputCh
@@ -179,6 +275,7 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 		// Try hot path first
 		if cfg := mgr.pool.ExtractPausedConfig(id); cfg != nil {
 			hydrateConfigFromDisk(cfg)
+			mgr.refreshExtractedURL(cfg)
 			cfg.IsResume = true
 
 			if mgr.eventBus != nil {
@@ -239,6 +336,7 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 		}
 
 		cfg := buildResumeConfig(id, outputPath, entry, savedState, settings)
+		mgr.refreshExtractedURL(&cfg)
 
 		if mgr.eventBus != nil {
 			cfg.ProgressCh = mgr.eventBus.InputCh
@@ -332,6 +430,8 @@ func (mgr *LifecycleManager) UpdateURL(id string, newURL string) error {
 // SupportsRange is false and the download restarts from the entry's Downloaded offset.
 func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, savedState *types.DownloadRecord, settings *config.Settings) types.DownloadRecord {
 	var destPath, url, filename string
+	var sourceURL, formatID, manifestURL string
+	var parts []types.DownloadPart
 	var totalSize, downloaded int64
 	var rateLimit int64
 	var rateLimitSet bool
@@ -344,6 +444,10 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		downloaded = entry.Downloaded
 		rateLimit = entry.RateLimit
 		rateLimitSet = entry.RateLimitSet
+		sourceURL = entry.SourceURL
+		formatID = entry.FormatID
+		parts = entry.Parts
+		manifestURL = entry.ManifestURL
 	} else if savedState != nil {
 		destPath = savedState.DestPath
 		url = savedState.URL
@@ -352,6 +456,22 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		downloaded = savedState.Downloaded
 		rateLimit = savedState.RateLimit
 		rateLimitSet = savedState.RateLimitSet
+		sourceURL = savedState.SourceURL
+		formatID = savedState.FormatID
+		parts = savedState.Parts
+		manifestURL = savedState.ManifestURL
+	}
+	// Either record may carry the extraction provenance, depending on which
+	// write happened last; the page URL is what makes a resume recoverable.
+	if sourceURL == "" && savedState != nil {
+		sourceURL = savedState.SourceURL
+		formatID = savedState.FormatID
+	}
+	if len(parts) == 0 && savedState != nil {
+		parts = savedState.Parts
+	}
+	if manifestURL == "" && savedState != nil {
+		manifestURL = savedState.ManifestURL
 	}
 
 	runtime := settings.ToRuntimeConfig()
@@ -415,6 +535,10 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		DestPath:        destPath,
 		ID:              id,
 		Filename:        filename,
+		SourceURL:       sourceURL,
+		FormatID:        formatID,
+		Parts:           parts,
+		ManifestURL:     manifestURL,
 		TotalSize:       totalSize,
 		SupportsRange:   savedState != nil && len(savedState.Tasks) > 0,
 		IsResume:        true,
