@@ -1272,3 +1272,160 @@ func TestLoadMasterListUnlocked_UnsupportedVersion_StartsFresh(t *testing.T) {
 		t.Fatalf("expected empty list, got %d items", len(list.Downloads))
 	}
 }
+
+// A download's extraction identity is what makes it resumable: the page URL,
+// the format, the stream list and the playlist URL. Every lifecycle writer
+// (started, paused, error, completed) rebuilds the record from an event that
+// carries none of them, so a status change must not erase them - it used to,
+// which cost the part protection in the integrity sweep and made a cold resume
+// download the page URL into the user's video file.
+func TestAddToMasterListKeepsExtractionIdentityAcrossStatusWrites(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	id := uuid.New().String()
+	original := types.DownloadRecord{
+		ID:          id,
+		URL:         "https://site.example/watch",
+		DestPath:    filepath.Join(tempDir, "clip.mkv"),
+		Filename:    "clip.mkv",
+		Status:      "queued",
+		SourceURL:   "https://site.example/watch",
+		FormatID:    "248+251",
+		ManifestURL: "https://site.example/master.m3u8",
+		Parts: []types.DownloadPart{
+			{URL: "https://cdn.example/v", Kind: types.PartKindVideo, Size: 900},
+			{URL: "https://cdn.example/a", Kind: types.PartKindAudio, Size: 100},
+		},
+	}
+	if err := AddToMasterList(original); err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	// What the EventStarted handler writes: the same id, none of the identity.
+	if err := AddToMasterList(types.DownloadRecord{
+		ID:       id,
+		URL:      original.URL,
+		DestPath: original.DestPath,
+		Filename: original.Filename,
+		Status:   "downloading",
+	}); err != nil {
+		t.Fatalf("status write: %v", err)
+	}
+
+	got, err := GetDownload(id)
+	if err != nil || got == nil {
+		t.Fatalf("GetDownload after status write: %v", err)
+	}
+	if got.Status != "downloading" {
+		t.Errorf("status = %q, want downloading", got.Status)
+	}
+	if got.SourceURL != original.SourceURL {
+		t.Errorf("SourceURL = %q, want %q", got.SourceURL, original.SourceURL)
+	}
+	if got.FormatID != original.FormatID {
+		t.Errorf("FormatID = %q, want %q", got.FormatID, original.FormatID)
+	}
+	if got.ManifestURL != original.ManifestURL {
+		t.Errorf("ManifestURL = %q, want %q", got.ManifestURL, original.ManifestURL)
+	}
+	if len(got.Parts) != len(original.Parts) {
+		t.Fatalf("Parts = %d, want %d", len(got.Parts), len(original.Parts))
+	}
+	if got.Parts[0].URL != original.Parts[0].URL || got.Parts[1].Kind != types.PartKindAudio {
+		t.Errorf("Parts were not preserved: %+v", got.Parts)
+	}
+}
+
+// An update that carries a new stream list replaces the old one: a refreshed
+// media URL hands back new signed part URLs, and keeping the previous ones
+// would send the engine to links that have expired.
+func TestAddToMasterListReplacesPartsWhenGivenNewOnes(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	id := uuid.New().String()
+	if err := AddToMasterList(types.DownloadRecord{
+		ID:  id,
+		URL: "https://site.example/watch",
+		Parts: []types.DownloadPart{
+			{URL: "https://cdn.example/old-v", Kind: types.PartKindVideo},
+			{URL: "https://cdn.example/old-a", Kind: types.PartKindAudio},
+		},
+	}); err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+
+	if err := AddToMasterList(types.DownloadRecord{
+		ID:  id,
+		URL: "https://site.example/watch",
+		Parts: []types.DownloadPart{
+			{URL: "https://cdn.example/new-v", Kind: types.PartKindVideo, Complete: true},
+			{URL: "https://cdn.example/new-a", Kind: types.PartKindAudio},
+		},
+	}); err != nil {
+		t.Fatalf("refresh write: %v", err)
+	}
+
+	got, err := GetDownload(id)
+	if err != nil || got == nil {
+		t.Fatalf("GetDownload after refresh: %v", err)
+	}
+	if got.Parts[0].URL != "https://cdn.example/new-v" || !got.Parts[0].Complete {
+		t.Errorf("refreshed parts were not stored: %+v", got.Parts)
+	}
+}
+
+// A finished stream must be recorded in both stores, or an interruption
+// between the two streams re-downloads the one that is already on disk.
+func TestSetPartCompleteRecordsInMasterAndDetailState(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	id := uuid.New().String()
+	destPath := filepath.Join(tempDir, "clip.mkv")
+	record := types.DownloadRecord{
+		ID:       id,
+		URL:      "https://site.example/watch",
+		DestPath: destPath,
+		Filename: "clip.mkv",
+		Status:   "downloading",
+		Parts: []types.DownloadPart{
+			{URL: "https://cdn.example/v", Kind: types.PartKindVideo, Size: 900},
+			{URL: "https://cdn.example/a", Kind: types.PartKindAudio, Size: 100},
+		},
+	}
+	if err := AddToMasterList(record); err != nil {
+		t.Fatalf("seed record: %v", err)
+	}
+	if err := SaveStateWithOptions(record.URL, destPath, &record, SaveStateOptions{SkipFileHash: true}); err != nil {
+		t.Fatalf("seed detail state: %v", err)
+	}
+
+	if err := SetPartComplete(id, 0); err != nil {
+		t.Fatalf("SetPartComplete: %v", err)
+	}
+
+	master, err := GetDownload(id)
+	if err != nil || master == nil {
+		t.Fatalf("GetDownload: %v", err)
+	}
+	if !master.Parts[0].Complete {
+		t.Error("master list does not record the finished stream")
+	}
+	if master.Parts[1].Complete {
+		t.Error("master list marked the unfinished stream complete")
+	}
+
+	saved, err := LoadState(record.URL, destPath)
+	if err != nil || saved == nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if !saved.Parts[0].Complete {
+		t.Error("detail state does not record the finished stream")
+	}
+
+	if err := SetPartComplete(id, 5); !errors.Is(err, types.ErrNotFound) {
+		t.Errorf("SetPartComplete(out of range) = %v, want ErrNotFound", err)
+	}
+}
