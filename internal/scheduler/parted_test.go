@@ -209,6 +209,34 @@ func TestRunPartedDownloadSkipsCompleteParts(t *testing.T) {
 	}
 }
 
+// A recorded stream whose working file is gone must be downloaded again. The
+// file can vanish (the store's integrity sweep, a failed move, the user), and
+// muxing the zero-byte file the downloader would otherwise recreate yields a
+// download that fails identically on every retry.
+func TestRunPartedDownloadRefetchesCompletePartWithoutItsFile(t *testing.T) {
+	video := []byte(strings.Repeat("v", 30000))
+	audio := []byte(strings.Repeat("a", 12000))
+	server := streamServer(t, map[string][]byte{"/video": video, "/audio": audio})
+
+	dir := t.TempDir()
+	withMuxer(t, &recordingMuxer{available: true})
+
+	cfg := partedRecord(t, dir, "clip.mkv", server.URL+"/video", server.URL+"/audio", int64(len(video)), int64(len(audio)))
+	cfg.Parts[0].Complete = true // recorded complete, but nothing on disk
+
+	if _, err := runPartedDownload(context.Background(), cfg, progress.CfgProgress(cfg), cfg.DestPath); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(cfg.DestPath + types.IncompleteSuffix)
+	if err != nil {
+		t.Fatalf("read muxed output: %v", err)
+	}
+	if string(got) != string(video)+string(audio) {
+		t.Errorf("muxed output is %d bytes, want the %d of both streams", len(got), len(video)+len(audio))
+	}
+}
+
 // Completion cannot be inferred from the working file's size: the concurrent
 // downloader preallocates it to the full length, so a barely-started part
 // looks finished on disk. Trusting that muxed a 26 MB stub out of a 1.3 GB

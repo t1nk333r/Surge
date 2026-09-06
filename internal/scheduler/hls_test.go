@@ -171,9 +171,11 @@ func TestRunManifestDownloadSkipsFragmentsAlreadyOnDisk(t *testing.T) {
 	withMuxer(t, &recordingMuxer{available: true})
 	cfg := manifestRecord(t, dir, "stream.mp4", server.URL+"/master.m3u8")
 
-	fragDir := cfg.DestPath + ".frags"
-	if err := os.MkdirAll(fragDir, 0o755); err != nil {
-		t.Fatalf("create fragment dir: %v", err)
+	fragDir := types.FragmentDirPath(cfg.DestPath)
+	// A resumed download's directory carries the marker written by its first
+	// attempt; without it the fragments cannot be attributed to this stream.
+	if err := prepareFragmentDir(fragDir, fragmentIdentity(cfg, []hls.Segment{{}, {}})); err != nil {
+		t.Fatalf("prepare fragment dir: %v", err)
 	}
 	if err := os.WriteFile(fragmentPath(fragDir, 0), fragments[0], 0o644); err != nil {
 		t.Fatalf("seed fragment: %v", err)
@@ -184,6 +186,41 @@ func TestRunManifestDownloadSkipsFragmentsAlreadyOnDisk(t *testing.T) {
 	}
 	if hits := server.fragmentHits.Load(); hits != 1 {
 		t.Errorf("fetched %d fragments, want only the missing one", hits)
+	}
+}
+
+// The fragment directory is named after the destination file, which the user
+// frees by removing a failed download. Fragments are trusted because they
+// exist, so a directory left behind by another stream must be discarded, or a
+// new download of a recycled name assembles someone else's video and reports
+// success.
+func TestRunManifestDownloadDiscardsAnotherStreamsFragments(t *testing.T) {
+	fragments := [][]byte{[]byte("one"), []byte("two")}
+	server := newHLSServer(t, fragments)
+
+	dir := t.TempDir()
+	withMuxer(t, &recordingMuxer{available: true})
+	cfg := manifestRecord(t, dir, "stream.mp4", server.URL+"/master.m3u8")
+
+	fragDir := types.FragmentDirPath(cfg.DestPath)
+	stale := manifestRecord(t, dir, "other.mp4", "https://elsewhere.example/other.m3u8")
+	if err := prepareFragmentDir(fragDir, fragmentIdentity(stale, []hls.Segment{{}, {}})); err != nil {
+		t.Fatalf("prepare fragment dir: %v", err)
+	}
+	if err := os.WriteFile(fragmentPath(fragDir, 0), []byte("someone else's video"), 0o644); err != nil {
+		t.Fatalf("seed stale fragment: %v", err)
+	}
+
+	if _, err := runManifestDownload(context.Background(), cfg, progress.CfgProgress(cfg), cfg.DestPath); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, err := os.ReadFile(cfg.DestPath + types.IncompleteSuffix)
+	if err != nil {
+		t.Fatalf("read assembled output: %v", err)
+	}
+	if want := string(fragments[0]) + string(fragments[1]); string(got) != want {
+		t.Errorf("assembled %q, want %q - stale fragments were reused", got, want)
 	}
 }
 
@@ -338,4 +375,63 @@ type recordingTransport struct {
 func (r recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	*r.seen = append(*r.seen, req.URL.String())
 	return r.inner.RoundTrip(req)
+}
+
+// A ranged fragment answered with the whole resource must be refused. CDN
+// edges and proxies do ignore Range; storing that body would put one full copy
+// of the resource into the stream per byte-range fragment, and the rename
+// would make it permanent.
+func TestFetchFragmentRefusesIgnoredByteRange(t *testing.T) {
+	body := []byte(strings.Repeat("x", 4096))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately ignore r.Header.Get("Range").
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	cfg := &types.DownloadRecord{Runtime: types.DefaultRuntimeConfig()}
+	fragment := hls.Segment{URL: server.URL + "/chunk", Offset: 0, Length: 512}
+	path := fragmentPath(dir, 0)
+
+	if _, err := fetchFragment(context.Background(), server.Client(), cfg, fragment, path); err == nil {
+		t.Fatal("expected the ignored byte range to fail the fragment")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("fragment was stored anyway: %v", err)
+	}
+}
+
+// A playlist is remote content and names its own fragment hosts, so the
+// credentials the extraction was issued for must not follow a fragment to
+// another host.
+func TestApplyFragmentHeadersWithholdsCredentialsCrossHost(t *testing.T) {
+	cfg := &types.DownloadRecord{
+		SourceURL: "https://site.example/watch",
+		Headers: map[string]string{
+			"Cookie":        "session=secret",
+			"Authorization": "Bearer secret",
+			"Referer":       "https://site.example/watch",
+		},
+		Runtime: types.DefaultRuntimeConfig(),
+	}
+
+	same, _ := http.NewRequest(http.MethodGet, "https://site.example/frag0.ts", nil)
+	applyFragmentHeaders(same, cfg, credentialHost(cfg))
+	if same.Header.Get("Cookie") != "session=secret" {
+		t.Errorf("same-host request lost its cookie: %q", same.Header.Get("Cookie"))
+	}
+
+	other, _ := http.NewRequest(http.MethodGet, "https://attacker.example/frag0.ts", nil)
+	applyFragmentHeaders(other, cfg, credentialHost(cfg))
+	if got := other.Header.Get("Cookie"); got != "" {
+		t.Errorf("cookie leaked to another host: %q", got)
+	}
+	if got := other.Header.Get("Authorization"); got != "" {
+		t.Errorf("authorization leaked to another host: %q", got)
+	}
+	if got := other.Header.Get("Referer"); got != "https://site.example/watch" {
+		t.Errorf("non-credential header was dropped: %q", got)
+	}
 }

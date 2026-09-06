@@ -200,6 +200,8 @@ func RunDownload(ctx context.Context, cfg *types.DownloadRecord) error {
 			totalSize:     effectiveTotalSize,
 			supportsRange: cfg.SupportsRange,
 			mirrors:       mirrors,
+			id:            cfg.ID,
+			progressCh:    cfg.ProgressCh,
 		})
 		if size > 0 {
 			effectiveTotalSize = size

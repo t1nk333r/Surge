@@ -77,6 +77,16 @@ const (
 	// mediaExtractionTimeout caps one extractor run. yt-dlp needs a few
 	// seconds for a normal page; anything beyond this is a hung tool.
 	mediaExtractionTimeout = 90 * time.Second
+	// speculativeExtractionTimeout caps the rescue attempt made when a probe
+	// failed and the content type gave no reason to expect media. Adding one
+	// dead URL should report the failure quickly.
+	speculativeExtractionTimeout = 20 * time.Second
+	// resumeRefreshTimeout caps the re-resolve a resume waits for. A known
+	// page resolves in seconds; a resume must not hang on a slow one.
+	resumeRefreshTimeout = 30 * time.Second
+	// resumeRefreshGrace is how long an extracted URL is assumed to still
+	// work after a pause, so the common pause-and-resume costs nothing.
+	resumeRefreshGrace = 2 * time.Minute
 )
 
 var reserveWorkingFile = precreateWorkingFile
@@ -368,7 +378,13 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 	// browsers frequently reject a ranged probe, and saving that error page as
 	// "the download" is never right.
 	if extractor.LooksExtractable(probeResult.ContentType) || probeErr != nil {
-		extracted, extractErr := mgr.extractMedia(ctx, req)
+		// A failed probe is a rescue attempt, not a known media page: give it
+		// a short budget so one dead URL cannot hold an add for 90 seconds.
+		timeout := mediaExtractionTimeout
+		if probeErr != nil && !extractor.LooksExtractable(probeResult.ContentType) {
+			timeout = speculativeExtractionTimeout
+		}
+		extracted, extractErr := mgr.extractMedia(ctx, req, timeout)
 		switch {
 		case extractErr != nil:
 			return "", "", extractErr
@@ -493,6 +509,10 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 			RateLimitSet: queuedEvent.RateLimitSet,
 			Workers:      queuedEvent.Workers,
 			MinChunkSize: queuedEvent.MinChunkSize,
+			SourceURL:    req.SourceURL,
+			FormatID:     req.FormatID,
+			Parts:        req.Parts,
+			ManifestURL:  req.ManifestURL,
 		}); err != nil {
 			utils.Debug("Lifecycle: Failed to persist queued download synchronously: %v", err)
 		}
@@ -517,13 +537,25 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 // recognise and cannot express as one file (a playlist, or only fragmented /
 // split formats) is refused: saving the HTML or a silent video instead would
 // be a wrong success.
-func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequest) (bool, error) {
+func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequest, timeout time.Duration) (bool, error) {
 	ex := mgr.mediaExtractor
 	if ex == nil || !ex.Available() {
 		return false, nil
 	}
 
-	extractCtx, cancel := context.WithTimeout(ctx, mediaExtractionTimeout)
+	// Extraction forks a process that holds a network connection, so it obeys
+	// the same concurrency cap as probing: a batch of unreachable URLs must
+	// not fork one yt-dlp per URL at once.
+	if mgr.probeSem != nil {
+		select {
+		case mgr.probeSem <- struct{}{}:
+			defer func() { <-mgr.probeSem }()
+		case <-ctx.Done():
+			return false, fmt.Errorf("extraction aborted before starting: %w", ctx.Err())
+		}
+	}
+
+	extractCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	media, err := ex.Resolve(extractCtx, req.URL, mgr.extractorOptions())
@@ -622,11 +654,15 @@ func (mgr *LifecycleManager) adoptPlaylistURL(req *DownloadRequest, probeResult 
 
 // playlistFilename derives a media file name from a playlist URL: the last
 // path element that names something, or the host, with an .mp4 extension
-// since that is what HLS fragments carry.
+// since that is what HLS fragments carry. The URL is remote input, so every
+// candidate goes through the same sanitiser an extracted title does - a path
+// segment can still decode to a backslash or a NUL.
 func playlistFilename(rawurl string) string {
+	const fallback = "stream.mp4"
+
 	parsed, err := neturl.Parse(rawurl)
 	if err != nil {
-		return "stream.mp4"
+		return fallback
 	}
 
 	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
@@ -637,12 +673,14 @@ func playlistFilename(rawurl string) string {
 			// These name the playlist, not the media behind it.
 			continue
 		}
-		return candidate + ".mp4"
+		if clean := extractor.SanitizeFilename(candidate); clean != "" {
+			return clean + ".mp4"
+		}
 	}
-	if host := parsed.Hostname(); host != "" {
+	if host := extractor.SanitizeFilename(parsed.Hostname()); host != "" {
 		return host + ".mp4"
 	}
-	return "stream.mp4"
+	return fallback
 }
 
 func mergeRequestHeaders(base, override map[string]string) map[string]string {

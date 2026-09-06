@@ -257,7 +257,7 @@ func Parse(data []byte, baseURL string) (*Playlist, error) {
 					durText = durText[:comma]
 				}
 				d, err := strconv.ParseFloat(strings.TrimSpace(durText), 64)
-				if err != nil {
+				if err != nil || math.IsNaN(d) || math.IsInf(d, 0) || d < 0 {
 					return nil, fmt.Errorf("line %d: %s: invalid duration %q", lineNo, tagInf, durText)
 				}
 				pendingDur = d
@@ -299,7 +299,7 @@ func Parse(data []byte, baseURL string) (*Playlist, error) {
 				// The spec says integer seconds; parsed as a float so a
 				// non-conforming "10.0" does not fail the whole download.
 				d, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-				if err != nil {
+				if err != nil || math.IsNaN(d) || math.IsInf(d, 0) || d < 0 {
 					return nil, fmt.Errorf("line %d: %s: invalid duration %q", lineNo, tagTargetDuration, value)
 				}
 				p.TargetDuration = d
@@ -325,7 +325,11 @@ func Parse(data []byte, baseURL string) (*Playlist, error) {
 		case havePendingDur:
 			seg := Segment{URL: resolved, Duration: pendingDur}
 			if pendingRange != nil {
-				seg.Offset, seg.Length = pendingRange.resolve(resolved, nextOffset)
+				offset, length, rangeErr := pendingRange.resolve(resolved, nextOffset)
+				if rangeErr != nil {
+					return nil, fmt.Errorf("line %d: %s: %w", lineNo, tagByteRange, rangeErr)
+				}
+				seg.Offset, seg.Length = offset, length
 			}
 			p.Segments = append(p.Segments, seg)
 			havePendingDur, pendingDur, pendingRange = false, 0, nil
@@ -397,7 +401,7 @@ func EstimatedSize(p *Playlist, bandwidthBitsPerSecond int) int64 {
 
 // resolve turns a pending EXT-X-BYTERANGE into a concrete offset and length for
 // segURL, advancing the per-resource continuation point.
-func (br byteRange) resolve(segURL string, nextOffset map[string]int64) (offset, length int64) {
+func (br byteRange) resolve(segURL string, nextOffset map[string]int64) (offset, length int64, err error) {
 	offset = br.offset
 	if !br.hasOffset {
 		// RFC 8216 4.3.2.2: without an offset the sub-range starts at the byte
@@ -407,8 +411,11 @@ func (br byteRange) resolve(segURL string, nextOffset map[string]int64) (offset,
 		// its first bytes over and over.
 		offset = nextOffset[segURL]
 	}
+	if offset > math.MaxInt64-br.length {
+		return 0, 0, fmt.Errorf("byte range %d@%d exceeds the addressable range", br.length, offset)
+	}
 	nextOffset[segURL] = offset + br.length
-	return offset, br.length
+	return offset, br.length, nil
 }
 
 // splitTag splits "#EXT-X-TAG:value" into tag and value. A tag without a colon
@@ -538,7 +545,11 @@ func initSectionFromAttrs(base *url.URL, a map[string]string, nextOffset map[str
 		}
 		// The init section is a sub-range like any other, so it moves the
 		// continuation point for segments that follow in the same resource.
-		init.Offset, init.Length = br.resolve(resolved, nextOffset)
+		offset, length, rangeErr := br.resolve(resolved, nextOffset)
+		if rangeErr != nil {
+			return nil, rangeErr
+		}
+		init.Offset, init.Length = offset, length
 	}
 	return init, nil
 }
@@ -561,6 +572,11 @@ func parseByteRange(value string) (byteRange, error) {
 			return byteRange{}, fmt.Errorf("invalid offset %q", offsetText)
 		}
 		br.offset, br.hasOffset = offset, true
+	}
+	// The pair becomes an HTTP range request, so a sum that wraps would ask
+	// for a negative end and fetch something other than what was declared.
+	if br.offset > math.MaxInt64-br.length {
+		return byteRange{}, fmt.Errorf("byte range %d@%d exceeds the addressable range", br.length, br.offset)
 	}
 	return br, nil
 }

@@ -121,7 +121,10 @@ the binary with `SURGE_FFMPEG`.
 Pause and resume work at stream granularity: a finished stream is recorded and
 not fetched again, while the stream that was in flight restarts. Completion is
 recorded explicitly rather than inferred from the file's size, because the
-concurrent downloader preallocates each stream file to its full length.
+concurrent downloader preallocates each stream file to its full length - and it
+is only honoured while the stream's file is still on disk and at least as large
+as the stream, so a working file that disappeared is downloaded again instead
+of being muxed empty.
 
 ### Fragmented streams (HLS)
 
@@ -139,11 +142,19 @@ other download (so the proxy and both rate limits apply), concatenates them in
 playlist order and remuxes the result with `ffmpeg` into the final container.
 Fragments live in `<name>.frags/` next to the file while the download runs and
 are removed once the assembly succeeds; a failed assembly keeps them, so a
-retry does not re-download.
+retry does not re-download. Removing the download removes them too, along with
+every other intermediate.
 
 Pause and resume work at fragment granularity: a fragment is written to a
 temporary name and renamed, so only a complete fragment counts and a resumed
-stream fetches just what is missing.
+stream fetches just what is missing. The directory records which playlist it
+belongs to, so fragments left by a different stream are discarded rather than
+assembled into the wrong file.
+
+A playlist is remote content: it names its own fragment URLs, and can name any
+host. Cookies and authorization headers obtained for the page are therefore
+sent only to that page's host, a fragment answered with the wrong byte range
+is rejected, and a playlist declaring more than 50,000 fragments is refused.
 
 Three kinds of stream are refused rather than downloaded wrongly:
 

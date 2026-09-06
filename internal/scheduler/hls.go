@@ -2,13 +2,14 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,16 @@ const maxManifestBytes = 8 << 20
 // temporary name and renamed, so the presence of this file — not its size — is
 // what says "done", which is what makes a resumed HLS download skip work.
 const fragmentSuffix = ".frag"
+
+// fragmentMarkerName records which stream a fragment directory holds, so a
+// directory left behind by a removed download cannot be mistaken for the
+// resume state of a different one.
+const fragmentMarkerName = ".stream"
+
+// maxFragments caps how many fragments one download may fetch. An 8MB
+// playlist can declare ~600k of them; each is an HTTP request, a file and a
+// stat on every resume. A real feature-length stream is a few thousand.
+const maxFragments = 50_000
 
 // ErrSeparateAudioRendition is returned for streams whose audio is a separate
 // rendition rather than part of the selected variant's segments. Downloading
@@ -69,6 +80,10 @@ func runManifestDownload(ctx context.Context, cfg *types.DownloadRecord, progSta
 	if len(fragments) == 0 {
 		return 0, fmt.Errorf("%s: playlist lists no fragments", cfg.URL)
 	}
+	if len(fragments) > maxFragments {
+		return 0, fmt.Errorf("%s: playlist declares %d fragments, more than the %d this download will fetch",
+			cfg.ManifestURL, len(fragments), maxFragments)
+	}
 
 	if estimate := hls.EstimatedSize(media, bandwidth); estimate > 0 && progState != nil {
 		// Fragment sizes are unknown until they arrive, so the bitrate-based
@@ -77,9 +92,9 @@ func runManifestDownload(ctx context.Context, cfg *types.DownloadRecord, progSta
 		progState.SetTotalSize(estimate)
 	}
 
-	fragDir := finalDestPath + ".frags"
-	if err := os.MkdirAll(fragDir, 0o755); err != nil {
-		return 0, fmt.Errorf("failed to create fragment directory: %w", err)
+	fragDir := types.FragmentDirPath(finalDestPath)
+	if err := prepareFragmentDir(fragDir, fragmentIdentity(cfg, fragments)); err != nil {
+		return 0, err
 	}
 
 	if err := fetchFragments(ctx, client, cfg, progState, fragDir, fragments); err != nil {
@@ -89,13 +104,13 @@ func runManifestDownload(ctx context.Context, cfg *types.DownloadRecord, progSta
 	// Concatenate in playlist order, then let ffmpeg put the result in a real
 	// container: a bare concatenation of transport-stream fragments plays, but
 	// it is not the .mp4/.mkv the user asked for and carries no index.
-	rawPath := finalDestPath + ".hlsraw"
+	rawPath := types.ConcatWorkingPath(finalDestPath)
 	if err := concatFragments(rawPath, fragDir, len(fragments)); err != nil {
 		return 0, err
 	}
 	defer os.Remove(rawPath)
 
-	muxTarget := finalDestPath + ".muxing" + filepath.Ext(finalDestPath)
+	muxTarget := types.MuxWorkingPath(finalDestPath)
 	utils.Debug("Remuxing %d fragments into %s", len(fragments), muxTarget)
 	if err := defaultMuxer.Remux(ctx, muxTarget, rawPath); err != nil {
 		return 0, fmt.Errorf("assembling the downloaded fragments failed: %w", err)
@@ -192,7 +207,7 @@ func fetchManifest(ctx context.Context, client *http.Client, cfg *types.Download
 	if err != nil {
 		return nil, fmt.Errorf("could not request playlist: %w", err)
 	}
-	applyFragmentHeaders(req, cfg)
+	applyFragmentHeaders(req, cfg, credentialHost(cfg))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -206,7 +221,16 @@ func fetchManifest(ctx context.Context, client *http.Client, cfg *types.Download
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("playlist request failed: unexpected status code: %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("could not read playlist: %w", err)
+	}
+	if len(body) > maxManifestBytes {
+		// Parsing a truncated playlist would download a prefix of the stream
+		// and then call it complete.
+		return nil, fmt.Errorf("playlist is larger than %d bytes; refusing to treat it as a playlist", maxManifestBytes)
+	}
+	return body, nil
 }
 
 // fetchFragments downloads every fragment that is not already on disk, using
@@ -228,27 +252,34 @@ func fetchFragments(
 		workers = len(fragments)
 	}
 
+	// The record's cancel function belongs to the scheduler's worker, which
+	// cancels the context this one derives from on both pause and delete, so
+	// there is nothing to install here - and installing it would leave the
+	// state holding a dead function for the concat and remux that follow.
 	fetchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if progState != nil {
-		progState.SetCancelFunc(cancel)
 		progState.ActiveWorkers.Store(int32(workers))
 		defer progState.ActiveWorkers.Store(0)
 	}
 
 	var (
-		next     atomic.Int64
-		done     atomic.Int64
-		bytesGot atomic.Int64
-		failure  error
-		failOnce sync.Once
-		wg       sync.WaitGroup
+		next      atomic.Int64
+		accounted atomic.Int64
+		bytesGot  atomic.Int64
+		failure   error
+		failOnce  sync.Once
+		wg        sync.WaitGroup
 	)
 
 	// Bytes already on disk from an earlier attempt count towards progress, so
-	// a resumed stream does not restart the bar at zero.
-	if existing := existingFragmentBytes(fragDir, len(fragments)); existing > 0 {
+	// a resumed stream does not restart the bar at zero. Those fragments count
+	// towards the sample the size estimate is extrapolated from too, or the
+	// first fetched fragment would look like it carried all of them.
+	existing, existingCount := existingFragments(fragDir, len(fragments))
+	if existing > 0 {
 		bytesGot.Store(existing)
+		accounted.Store(int64(existingCount))
 		if progState != nil {
 			progState.Bytes.Downloaded.Store(existing)
 			progState.Bytes.VerifiedProgress.Store(existing)
@@ -276,10 +307,12 @@ func fetchFragments(
 				}
 
 				total := bytesGot.Add(written)
-				count := done.Add(1)
+				count := accounted.Add(1)
 				if progState != nil {
-					progState.Bytes.Downloaded.Store(total)
-					progState.Bytes.VerifiedProgress.Store(total)
+					// Two workers can finish out of order; the byte count a
+					// user watches must never tick backwards.
+					storeMax(&progState.Bytes.Downloaded, total)
+					storeMax(&progState.Bytes.VerifiedProgress, total)
 					// With unknown fragment sizes the estimate can be beaten;
 					// never report more than the total, and grow the total
 					// once the estimate is clearly wrong.
@@ -318,8 +351,9 @@ func fetchFragment(ctx context.Context, client *http.Client, cfg *types.Download
 	if err != nil {
 		return 0, fmt.Errorf("could not request fragment: %w", err)
 	}
-	applyFragmentHeaders(req, cfg)
-	if fragment.Length > 0 {
+	applyFragmentHeaders(req, cfg, credentialHost(cfg))
+	ranged := fragment.Length > 0
+	if ranged {
 		// A byte-range fragment is a slice of a larger resource.
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", fragment.Offset, fragment.Offset+fragment.Length-1))
 	}
@@ -330,7 +364,13 @@ func fetchFragment(ctx context.Context, client *http.Client, cfg *types.Download
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	switch {
+	case ranged && resp.StatusCode != http.StatusPartialContent:
+		// A 200 to a ranged request means the server sent the whole resource.
+		// Storing it would put one full copy per fragment into the assembled
+		// stream, and the rename would make that permanent.
+		return 0, fmt.Errorf("fragment request failed: server ignored the byte range (status %d)", resp.StatusCode)
+	case !ranged && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent:
 		return 0, fmt.Errorf("fragment request failed: unexpected status code: %d", resp.StatusCode)
 	}
 
@@ -355,6 +395,9 @@ func fetchFragment(ctx context.Context, client *http.Client, cfg *types.Download
 	}
 	if closeErr != nil {
 		return 0, fmt.Errorf("could not finish fragment file: %w", closeErr)
+	}
+	if ranged && written != fragment.Length {
+		return 0, fmt.Errorf("fragment request failed: got %d bytes of the %d requested", written, fragment.Length)
 	}
 
 	if err := os.Rename(tmpName, path); err != nil {
@@ -383,9 +426,26 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func applyFragmentHeaders(req *http.Request, cfg *types.DownloadRecord) {
+// credentialHeaders travel with the site that issued them. A playlist is
+// remote content and can name any host for its variants and fragments, so
+// replaying a session cookie or a bearer token to that host would hand the
+// user's credentials to whoever wrote the playlist.
+var credentialHeaders = map[string]bool{
+	"cookie":              true,
+	"authorization":       true,
+	"proxy-authorization": true,
+}
+
+// applyFragmentHeaders copies the download's headers onto a playlist or
+// fragment request. issuer is the host the headers were issued for;
+// anything else gets the request without them.
+func applyFragmentHeaders(req *http.Request, cfg *types.DownloadRecord, issuer string) {
+	sameHost := issuer == "" || strings.EqualFold(req.URL.Host, issuer)
 	for key, value := range cfg.Headers {
 		if strings.EqualFold(key, "Range") {
+			continue
+		}
+		if !sameHost && credentialHeaders[strings.ToLower(key)] {
 			continue
 		}
 		req.Header.Set(key, value)
@@ -395,23 +455,103 @@ func applyFragmentHeaders(req *http.Request, cfg *types.DownloadRecord) {
 	}
 }
 
+// credentialHost is the host a download's headers belong to: the page the
+// media was extracted from when there is one, else the playlist's own host.
+func credentialHost(cfg *types.DownloadRecord) string {
+	for _, candidate := range []string{cfg.SourceURL, cfg.ManifestURL} {
+		if candidate == "" {
+			continue
+		}
+		if parsed, err := neturl.Parse(candidate); err == nil && parsed.Host != "" {
+			return parsed.Host
+		}
+	}
+	return ""
+}
+
 func fragmentPath(fragDir string, index int) string {
 	return filepath.Join(fragDir, fmt.Sprintf("%06d%s", index, fragmentSuffix))
 }
 
-func existingFragmentBytes(fragDir string, count int) int64 {
+// fragmentIdentity is what makes a fragment directory belong to one stream:
+// the playlist it was built from and how many fragments that playlist had.
+func fragmentIdentity(cfg *types.DownloadRecord, fragments []hls.Segment) string {
+	sum := sha256.Sum256([]byte(cfg.ManifestURL))
+	return fmt.Sprintf("%x %d\n", sum[:16], len(fragments))
+}
+
+// prepareFragmentDir creates the fragment directory and makes sure whatever is
+// already in it belongs to this download. A fragment is trusted purely because
+// it is on disk, and the directory name is derived from the destination file,
+// which the user can free by removing a failed download - so without this
+// check a new stream saved under a recycled name would silently inherit the
+// old fragments and assemble another video's data.
+func prepareFragmentDir(fragDir, identity string) error {
+	if err := os.MkdirAll(fragDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create fragment directory: %w", err)
+	}
+
+	markerPath := filepath.Join(fragDir, fragmentMarkerName)
+	stored, readErr := os.ReadFile(markerPath)
+	switch {
+	case readErr == nil && string(stored) == identity:
+		return nil
+	case readErr == nil, !os.IsNotExist(readErr), !fragmentDirIsEmpty(fragDir):
+		// A different stream's marker, an unreadable one, or fragments with no
+		// marker at all: nothing here can be attributed to this download, and
+		// a fragment is trusted purely because it exists.
+		utils.Debug("Fragment directory %s does not belong to this stream; discarding it", fragDir)
+		if err := os.RemoveAll(fragDir); err != nil {
+			return fmt.Errorf("could not clear stale fragments: %w", err)
+		}
+		if err := os.MkdirAll(fragDir, 0o755); err != nil {
+			return fmt.Errorf("failed to create fragment directory: %w", err)
+		}
+	}
+
+	if err := os.WriteFile(markerPath, []byte(identity), 0o644); err != nil {
+		return fmt.Errorf("could not record the fragment directory's stream: %w", err)
+	}
+	return nil
+}
+
+func fragmentDirIsEmpty(fragDir string) bool {
+	entries, err := os.ReadDir(fragDir)
+	if err != nil {
+		return false
+	}
+	return len(entries) == 0
+}
+
+// existingFragments reports how many bytes of how many fragments an earlier
+// attempt already left on disk.
+func existingFragments(fragDir string, count int) (int64, int) {
 	var total int64
+	var found int
 	for i := range count {
 		if info, err := os.Stat(fragmentPath(fragDir, i)); err == nil {
 			total += info.Size()
+			found++
 		}
 	}
-	return total
+	return total, found
 }
 
-// concatFragments joins the fragments in playlist order. Order is taken from
-// the index in each name rather than from directory order, which is not sorted
-// on every filesystem.
+// storeMax publishes a monotonically increasing counter from concurrent
+// writers without letting a late, smaller value undo a larger one.
+func storeMax(counter *atomic.Int64, value int64) {
+	for {
+		current := counter.Load()
+		if value <= current || counter.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+// concatFragments joins the fragments in playlist order. The order is the
+// fragment index, not a sort of the names and not directory order: a name is
+// only a rendering of the index, and a zero-padded number stops sorting
+// correctly as soon as it needs one digit more than the padding.
 func concatFragments(rawPath, fragDir string, count int) error {
 	out, err := os.Create(rawPath)
 	if err != nil {
@@ -423,7 +563,6 @@ func concatFragments(rawPath, fragDir string, count int) error {
 	for i := range count {
 		names = append(names, fragmentPath(fragDir, i))
 	}
-	sort.Strings(names)
 
 	for _, name := range names {
 		fragment, err := os.Open(name)

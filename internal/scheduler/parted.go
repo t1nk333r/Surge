@@ -38,6 +38,13 @@ type streamSpec struct {
 	totalSize     int64
 	supportsRange bool
 	mirrors       []string
+	// id is what the downloader persists its pause snapshot under, and
+	// progressCh is where it publishes lifecycle events. A part MUST NOT
+	// borrow the record's: the downloaders save their own URL, dest path and
+	// size under the id they are given, which would rewrite the record to
+	// point at "<name>.p0.video" and an expiring stream URL.
+	id         string
+	progressCh chan<- types.DownloadEvent
 }
 
 // acquireStream downloads one HTTP file into spec.destPath + ".surge" using the
@@ -73,7 +80,7 @@ func acquireStream(ctx context.Context, cfg *types.DownloadRecord, progState *pr
 			utils.Debug("Found %d active mirrors from %d candidates", len(activeMirrors), len(spec.mirrors))
 		}
 
-		d := concurrent.NewConcurrentDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
+		d := concurrent.NewConcurrentDownloader(spec.id, spec.progressCh, progState, cfg.Runtime)
 		d.Headers = spec.headers
 		d.Limiter = cfg.Limiter
 		d.RateLimitBps = cfg.RateLimit
@@ -102,7 +109,7 @@ func acquireStream(ctx context.Context, cfg *types.DownloadRecord, progState *pr
 
 	if !useConcurrent {
 		utils.Debug("Using single-threaded downloader for %s", spec.filename)
-		d := single.NewSingleDownloader(cfg.ID, cfg.ProgressCh, progState, cfg.Runtime)
+		d := single.NewSingleDownloader(spec.id, spec.progressCh, progState, cfg.Runtime)
 		d.Headers = spec.headers
 		d.Limiter = cfg.Limiter
 		downloadErr = d.Download(ctx, spec.url, spec.destPath, totalSize, spec.filename)
@@ -130,8 +137,16 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 		return 0, fmt.Errorf("%w: cannot combine the video and audio streams", mux.ErrNotAvailable)
 	}
 
+	// The extractor may not know a stream's size. Summing what is known would
+	// publish a total that is too small, and the bar would run past 100% for
+	// the whole of the unmeasured stream; an unknown total lets the supervisor
+	// report the sizes the responses reveal instead.
 	var expectedTotal int64
 	for _, part := range cfg.Parts {
+		if part.Size <= 0 {
+			expectedTotal = 0
+			break
+		}
 		expectedTotal += part.Size
 	}
 	if progState != nil && expectedTotal > 0 {
@@ -150,16 +165,18 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 		workingPath := partDest + types.IncompleteSuffix
 		inputs = append(inputs, mux.Input{Path: workingPath, Kind: muxKind(part.Kind)})
 
-		// The downloaders require the working file to exist already; for a
-		// plain download the orchestrator reserves it, for parts we do.
-		if err := ensureWorkingFile(workingPath); err != nil {
-			return 0, err
+		// A recorded stream still has to be on disk: the integrity sweep, a
+		// half-finished move or the user can remove a working file, and
+		// muxing an empty input would produce a file with a missing track
+		// rather than an error.
+		onDisk := int64(-1)
+		if info, statErr := os.Stat(workingPath); statErr == nil {
+			onDisk = info.Size()
 		}
-
-		if part.Complete {
+		if part.Complete && onDisk > 0 && (part.Size <= 0 || onDisk >= part.Size) {
 			size := part.Size
-			if info, statErr := os.Stat(workingPath); statErr == nil && size <= 0 {
-				size = info.Size()
+			if size <= 0 {
+				size = onDisk
 			}
 			utils.Debug("Part %d (%s) already downloaded, skipping", i, part.Kind)
 			completedBytes += size
@@ -169,6 +186,16 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 			}
 			continue
 		}
+		if part.Complete {
+			utils.Debug("Part %d (%s) was recorded complete but holds %d of %d bytes; downloading it again",
+				i, part.Kind, onDisk, part.Size)
+		}
+
+		// The downloaders require the working file to exist already; for a
+		// plain download the orchestrator reserves it, for parts we do.
+		if err := ensureWorkingFile(workingPath); err != nil {
+			return 0, err
+		}
 
 		partState := progress.New(fmt.Sprintf("%s#%s", cfg.ID, part.Kind), part.Size)
 		partState.SetDestPath(partDest)
@@ -177,6 +204,7 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 		partState.SyncSessionStart()
 
 		stopSupervisor := supervisePart(progState, partState, completedBytes, expectedTotal)
+		partID := fmt.Sprintf("%s#p%d", cfg.ID, i)
 		size, err := acquireStream(ctx, cfg, partState, streamSpec{
 			url:      part.URL,
 			headers:  part.Headers,
@@ -186,8 +214,20 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 			// approximate, so let the downloader confirm from the response.
 			totalSize:     0,
 			supportsRange: true,
+			// The part's own store id: its snapshot describes one stream, not
+			// the download, and writing it under the record's id would rewrite
+			// the record to point at the part file and an expiring stream URL.
+			// No event channel either - the record's lifecycle events are
+			// published by the scheduler around this call.
+			id: partID,
 		})
 		stopSupervisor()
+
+		// A part's snapshot is never read: a resumed part restarts from zero
+		// (resume is at stream granularity), so the file would just accumulate.
+		if delErr := store.DeleteState(partID); delErr != nil && !errors.Is(delErr, types.ErrNotFound) {
+			utils.Debug("Could not drop part state %s: %v", partID, delErr)
+		}
 
 		if err != nil {
 			return 0, err
@@ -217,7 +257,7 @@ func runPartedDownload(ctx context.Context, cfg *types.DownloadRecord, progState
 	// rename in the same directory is atomic, so the working file is either
 	// untouched or complete.
 	target := finalDestPath + types.IncompleteSuffix
-	muxTarget := finalDestPath + ".muxing" + filepath.Ext(finalDestPath)
+	muxTarget := types.MuxWorkingPath(finalDestPath)
 	utils.Debug("Muxing %d parts into %s with %s", len(inputs), muxTarget, defaultMuxer.Name())
 	if err := defaultMuxer.Mux(ctx, muxTarget, inputs...); err != nil {
 		return 0, fmt.Errorf("combining the downloaded streams failed: %w", err)

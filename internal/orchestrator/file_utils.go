@@ -198,15 +198,38 @@ func ResolveDestination(url, candidateFilename, defaultDir string, routeToCatego
 	return destPath, finalFilename, nil
 }
 
-// RemoveIncompleteFile drops only the reserved working file, leaving any
-// promoted final file untouched.
+// RemoveIncompleteFile drops the reserved working file and every intermediate
+// a media download leaves beside it, leaving any promoted final file
+// untouched. The intermediates can be far larger than the final file (a
+// fragment directory holds the whole stream), so a removed download must not
+// leave them behind.
 func RemoveIncompleteFile(destPath string) error {
 	if destPath == "" {
 		return nil
 	}
-	surgePath := destPath + types.IncompleteSuffix
-	if err := retryRemove(surgePath); err != nil && !os.IsNotExist(err) {
-		return err
+
+	var firstErr error
+	drop := func(err error) {
+		if err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+
+	drop(retryRemove(destPath + types.IncompleteSuffix))
+	drop(retryRemove(types.ConcatWorkingPath(destPath)))
+	drop(retryRemove(types.MuxWorkingPath(destPath)))
+	if err := os.RemoveAll(types.FragmentDirPath(destPath)); err != nil {
+		drop(err)
+	}
+
+	// Stream working files: the record is not available here, and the kind is
+	// part of the name, so match on the shape the engine writes.
+	parts, globErr := filepath.Glob(destPath + ".p[0-9]*.*" + types.IncompleteSuffix)
+	if globErr == nil {
+		for _, part := range parts {
+			drop(retryRemove(part))
+		}
+	}
+
+	return firstErr
 }

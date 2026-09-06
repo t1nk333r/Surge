@@ -51,7 +51,7 @@ func TestExtractMediaRewritesRequest(t *testing.T) {
 		Mirrors: []string{"https://site.example/watch?v=1&mirror=2"},
 	}
 
-	extracted, err := mgr.extractMedia(context.Background(), req)
+	extracted, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestExtractMediaForwardsTheConfiguredProxy(t *testing.T) {
 	ex := &fakeExtractor{available: true, media: &extractor.Media{URL: "https://cdn/x.mp4"}}
 	mgr := &LifecycleManager{mediaExtractor: ex, settings: settings}
 
-	if _, err := mgr.extractMedia(context.Background(), &DownloadRequest{URL: "https://site/watch"}); err != nil {
+	if _, err := mgr.extractMedia(context.Background(), &DownloadRequest{URL: "https://site/watch"}, mediaExtractionTimeout); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if ex.gotOpts.ProxyURL != "http://127.0.0.1:8080" {
@@ -108,7 +108,7 @@ func TestExtractMediaKeepsCallerFilename(t *testing.T) {
 	mgr := &LifecycleManager{mediaExtractor: ex}
 	req := &DownloadRequest{URL: "https://site/watch", Filename: "chosen.mp4"}
 
-	if _, err := mgr.extractMedia(context.Background(), req); err != nil {
+	if _, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if req.Filename != "chosen.mp4" {
@@ -128,7 +128,7 @@ func TestExtractMediaRefusesUndownloadableMedia(t *testing.T) {
 			mgr := &LifecycleManager{mediaExtractor: &fakeExtractor{available: true, err: sentinel}}
 			req := &DownloadRequest{URL: "https://site/watch"}
 
-			extracted, err := mgr.extractMedia(context.Background(), req)
+			extracted, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
 			if extracted {
 				t.Fatal("request must not be rewritten")
 			}
@@ -148,7 +148,7 @@ func TestExtractMediaFallsThroughForUnsupportedPages(t *testing.T) {
 	mgr := &LifecycleManager{mediaExtractor: &fakeExtractor{available: true, err: extractor.ErrUnsupportedURL}}
 	req := &DownloadRequest{URL: "https://blog.example/post.html"}
 
-	extracted, err := mgr.extractMedia(context.Background(), req)
+	extracted, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
 	if err != nil || extracted {
 		t.Fatalf("extracted = %v, err = %v; want (false, nil)", extracted, err)
 	}
@@ -159,7 +159,7 @@ func TestExtractMediaSkippedWhenToolMissing(t *testing.T) {
 	mgr := &LifecycleManager{mediaExtractor: ex}
 	req := &DownloadRequest{URL: "https://site/watch"}
 
-	extracted, err := mgr.extractMedia(context.Background(), req)
+	extracted, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
 	if err != nil || extracted {
 		t.Fatalf("extracted = %v, err = %v; want (false, nil)", extracted, err)
 	}
@@ -172,7 +172,7 @@ func TestExtractMediaDisabledWithNilExtractor(t *testing.T) {
 	mgr := &LifecycleManager{}
 	req := &DownloadRequest{URL: "https://site/watch"}
 
-	extracted, err := mgr.extractMedia(context.Background(), req)
+	extracted, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
 	if err != nil || extracted {
 		t.Fatalf("extracted = %v, err = %v; want (false, nil)", extracted, err)
 	}

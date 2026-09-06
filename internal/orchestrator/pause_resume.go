@@ -68,6 +68,11 @@ func hydrateConfigFromDisk(cfg *types.DownloadRecord) {
 	if len(saved.Parts) > 0 {
 		cfg.Parts = carryPartProgress(cfg.Parts, saved.Parts)
 	}
+	// When the pause happened decides whether an extracted URL needs
+	// re-resolving before the download restarts.
+	if saved.PausedAt > 0 {
+		cfg.PausedAt = saved.PausedAt
+	}
 }
 
 // carryPartProgress copies the completion flags of the previous part list onto
@@ -109,8 +114,29 @@ func (mgr *LifecycleManager) refreshExtractedURL(cfg *types.DownloadRecord) {
 	if ex == nil || !ex.Available() {
 		return
 	}
+	if cfg.PausedAt > 0 && time.Since(time.Unix(cfg.PausedAt, 0)) < resumeRefreshGrace {
+		// The URL was still working moments ago. Re-resolving it would fork a
+		// process and hold the caller - the API request or a keypress - for
+		// nothing.
+		return
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), mediaExtractionTimeout)
+	// A resume waits for this, so it gets a short budget and the same
+	// concurrency cap as probing: resuming ten items must not fork ten
+	// extractors nor block for ten timeouts.
+	if mgr.probeSem != nil {
+		select {
+		case mgr.probeSem <- struct{}{}:
+			defer func() { <-mgr.probeSem }()
+		default:
+			// Probing is saturated; a stale URL still gets one attempt from
+			// the engine, and UpdateURL repairs it on the next resume.
+			utils.Debug("Resume: skipping URL refresh for %s: extraction slots busy", cfg.ID)
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), resumeRefreshTimeout)
 	defer cancel()
 
 	media, err := ex.Resolve(ctx, cfg.SourceURL, mgr.extractorOptions())
@@ -431,6 +457,7 @@ func (mgr *LifecycleManager) UpdateURL(id string, newURL string) error {
 func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, savedState *types.DownloadRecord, settings *config.Settings) types.DownloadRecord {
 	var destPath, url, filename string
 	var sourceURL, formatID, manifestURL string
+	var pausedAt int64
 	var parts []types.DownloadPart
 	var totalSize, downloaded int64
 	var rateLimit int64
@@ -469,6 +496,11 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 	}
 	if len(parts) == 0 && savedState != nil {
 		parts = savedState.Parts
+	}
+	// The pause timestamp only exists on the persisted snapshot; it decides
+	// whether an extracted URL is stale enough to need re-resolving.
+	if savedState != nil {
+		pausedAt = savedState.PausedAt
 	}
 	if manifestURL == "" && savedState != nil {
 		manifestURL = savedState.ManifestURL
@@ -539,6 +571,7 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		FormatID:        formatID,
 		Parts:           parts,
 		ManifestURL:     manifestURL,
+		PausedAt:        pausedAt,
 		TotalSize:       totalSize,
 		SupportsRange:   savedState != nil && len(savedState.Tasks) > 0,
 		IsResume:        true,

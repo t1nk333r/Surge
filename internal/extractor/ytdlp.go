@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/SurgeDM/Surge/internal/mux"
 )
@@ -18,6 +19,15 @@ import (
 // DefaultYtDlpBinary is the executable looked up on PATH. Override it with
 // SURGE_YTDLP for a non-standard install.
 const DefaultYtDlpBinary = "yt-dlp"
+
+// maxFilenameBytes keeps a derived name well inside the 255-byte limit every
+// common filesystem imposes, leaving room for an extension and a "(1)" suffix.
+const maxFilenameBytes = 150
+
+// maxExtractorOutput caps the JSON one extraction may return. A 4K video with
+// every format listed is a few hundred kilobytes; a hundred times that is a
+// page trying to exhaust the daemon.
+const maxExtractorOutput = 32 << 20
 
 // YtDlp resolves media URLs through yt-dlp's JSON dump (`yt-dlp -J`).
 //
@@ -73,13 +83,20 @@ func (y *YtDlp) Resolve(ctx context.Context, pageURL string, opts Options) (*Med
 		return nil, ErrNotAvailable
 	}
 
-	var stdout, stderr bytes.Buffer
+	// A page controls how much JSON yt-dlp prints (titles, descriptions, one
+	// entry per format), and the whole thing is decoded in memory, so the
+	// daemon's footprint must not be the page's choice.
+	stdout := &boundedBuffer{limit: maxExtractorOutput}
+	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, binary, ytDlpArgs(pageURL, opts)...)
-	cmd.Stdout = &stdout
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("yt-dlp aborted: %w", ctxErr)
+		}
+		if stdout.overflowed {
+			return nil, fmt.Errorf("yt-dlp returned more than %d bytes of metadata", maxExtractorOutput)
 		}
 		message := firstLine(stderr.String())
 		if isUnsupportedURL(message) {
@@ -90,8 +107,34 @@ func (y *YtDlp) Resolve(ctx context.Context, pageURL string, opts Options) (*Med
 		}
 		return nil, fmt.Errorf("yt-dlp failed: %s", message)
 	}
+	if stdout.overflowed {
+		return nil, fmt.Errorf("yt-dlp returned more than %d bytes of metadata", maxExtractorOutput)
+	}
 
-	return parseYtDlpJSON(stdout.Bytes(), pageURL)
+	return parseYtDlpJSON(stdout.buf.Bytes(), pageURL)
+}
+
+// boundedBuffer collects a child process's output up to a limit and records
+// that it was exceeded, rather than growing to whatever the child writes.
+type boundedBuffer struct {
+	buf        bytes.Buffer
+	limit      int
+	overflowed bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - b.buf.Len(); room > 0 {
+		if len(p) <= room {
+			return b.buf.Write(p)
+		}
+		if _, err := b.buf.Write(p[:room]); err != nil {
+			return 0, err
+		}
+	}
+	// Keep accepting the write: killing the pipe would turn a size problem
+	// into an opaque "broken pipe" from the child.
+	b.overflowed = true
+	return len(p), nil
 }
 
 // ytDlpArgs builds the argument list for one extraction. It is a separate
@@ -415,7 +458,7 @@ func mergeHeaders(base, override map[string]string) map[string]string {
 
 // mediaFilename builds a filesystem-safe "<title>.<ext>".
 func mediaFilename(title, ext, fallbackExt string) string {
-	name := sanitizeFilenamePart(title)
+	name := SanitizeFilename(title)
 	if name == "" {
 		return ""
 	}
@@ -423,16 +466,16 @@ func mediaFilename(title, ext, fallbackExt string) string {
 	if extension == "" {
 		extension = strings.TrimPrefix(strings.TrimSpace(fallbackExt), ".")
 	}
-	extension = sanitizeFilenamePart(extension)
+	extension = SanitizeFilename(extension)
 	if extension == "" {
 		return name
 	}
 	return name + "." + extension
 }
 
-// sanitizeFilenamePart strips path separators and control characters, plus the
+// SanitizeFilename strips path separators and control characters, plus the
 // characters Windows refuses, and trims to a length every filesystem accepts.
-func sanitizeFilenamePart(value string) string {
+func SanitizeFilename(value string) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch r {
 		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
@@ -445,8 +488,14 @@ func sanitizeFilenamePart(value string) string {
 	}, value)
 
 	cleaned = strings.Trim(strings.TrimSpace(cleaned), ". ")
-	if len(cleaned) > 150 {
-		cleaned = strings.TrimSpace(cleaned[:150])
+	// Truncate on a rune boundary: half a multi-byte character is not a
+	// character, and some filesystems reject invalid UTF-8 outright.
+	if len(cleaned) > maxFilenameBytes {
+		cut := maxFilenameBytes
+		for cut > 0 && !utf8.RuneStart(cleaned[cut]) {
+			cut--
+		}
+		cleaned = strings.TrimSpace(cleaned[:cut])
 	}
 	if cleaned == "." || cleaned == ".." {
 		return ""

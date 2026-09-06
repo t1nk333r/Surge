@@ -161,7 +161,7 @@ func (s *LocalDownloadService) Purge(id string) error {
 		if err := utils.RemoveFile(destPath); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())
 		}
-		if err := utils.RemoveFile(destPath + types.IncompleteSuffix); err != nil && !os.IsNotExist(err) {
+		if err := orchestrator.RemoveIncompleteFile(destPath); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())
 		}
 		if len(errs) > 0 {

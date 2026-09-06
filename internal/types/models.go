@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/binary"
 	"fmt"
+	"path/filepath"
 )
 
 // Task represents a byte range to download.
@@ -133,6 +134,26 @@ func PartWorkingPath(destPath string, index int, kind string) string {
 		kind = fmt.Sprintf("part%d", index)
 	}
 	return fmt.Sprintf("%s.p%d.%s", destPath, index, kind)
+}
+
+// FragmentDirPath is the directory a fragmented (HLS) download keeps its
+// fetched fragments in while it runs. A fragment is present only once it is
+// complete, so the directory is also the resume state.
+func FragmentDirPath(destPath string) string {
+	return destPath + ".frags"
+}
+
+// ConcatWorkingPath is the file a fragmented download concatenates its
+// fragments into before the container is rebuilt.
+func ConcatWorkingPath(destPath string) string {
+	return destPath + ".hlsraw"
+}
+
+// MuxWorkingPath is where ffmpeg writes the assembled file. It keeps the
+// destination's extension, because that is how ffmpeg chooses its output
+// container, and the working file's ".surge" tells it nothing.
+func MuxWorkingPath(destPath string) string {
+	return destPath + ".muxing" + filepath.Ext(destPath)
 }
 
 // MasterList holds all tracked downloads.

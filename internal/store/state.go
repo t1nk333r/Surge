@@ -376,6 +376,7 @@ func AddToMasterList(entry types.DownloadRecord) error {
 	found := false
 	for i, e := range list.Downloads {
 		if e.ID == entry.ID {
+			carryMediaProvenance(&entry, e)
 			list.Downloads[i] = entry
 			found = true
 			break
@@ -385,6 +386,27 @@ func AddToMasterList(entry types.DownloadRecord) error {
 		list.Downloads = append(list.Downloads, entry)
 	}
 	return saveMasterListLocked(list)
+}
+
+// carryMediaProvenance keeps a download's extraction identity across status
+// writes. Most master-list writers build a record from a lifecycle event,
+// which carries only what the engine needs to run; the page URL, format, the
+// stream list and the playlist URL are what make a media download resumable
+// and what tells the integrity sweep which working files belong to it, so an
+// update that does not mention them must not erase them.
+func carryMediaProvenance(entry *types.DownloadRecord, prev types.DownloadRecord) {
+	if entry.SourceURL == "" {
+		entry.SourceURL = prev.SourceURL
+	}
+	if entry.FormatID == "" {
+		entry.FormatID = prev.FormatID
+	}
+	if entry.ManifestURL == "" {
+		entry.ManifestURL = prev.ManifestURL
+	}
+	if len(entry.Parts) == 0 {
+		entry.Parts = prev.Parts
+	}
 }
 
 func loadMasterListUnlocked() (*types.MasterList, error) {
@@ -530,38 +552,22 @@ func UpdateURL(id string, newURL string) error {
 // fetched in full, in both the master list and the detail state, so a resume
 // from either path skips it instead of downloading it twice.
 func SetPartComplete(id string, index int) error {
+	if index < 0 {
+		return fmt.Errorf("%w: part %d of %s", types.ErrNotFound, index, id)
+	}
+
 	masterMu.Lock()
 	defer masterMu.Unlock()
 
-	list, err := loadMasterListUnlocked()
-	if err != nil {
-		return err
-	}
-
-	found := false
-	for i := range list.Downloads {
-		if list.Downloads[i].ID != id {
-			continue
-		}
-		if index < 0 || index >= len(list.Downloads[i].Parts) {
-			return fmt.Errorf("%w: part %d of %s", types.ErrNotFound, index, id)
-		}
-		list.Downloads[i].Parts[index].Complete = true
-		found = true
-		break
-	}
-	if !found {
-		return fmt.Errorf("%w: %s", types.ErrNotFound, id)
-	}
-
-	// The detail state is what a hot-path resume hydrates from; keep the two
-	// in step so neither can claim a finished part is still pending.
-	dir := baseDir
-	if dir != "" {
+	// The detail state is what a hot-path resume hydrates from, and it is
+	// written independently of the master list; update it even when the
+	// master entry has no part list yet, so a crash cannot cost a finished
+	// stream just because the two stores disagree.
+	if baseDir != "" {
 		var ds DetailState
-		detailPath := getDetailPath(dir, id)
+		detailPath := getDetailPath(baseDir, id)
 		if err := loadGob(detailPath, &ds); err == nil && ds.State != nil &&
-			index >= 0 && index < len(ds.State.Parts) {
+			index < len(ds.State.Parts) {
 			ds.State.Parts[index].Complete = true
 			if writeErr := atomicWrite(detailPath, ds); writeErr != nil {
 				utils.Debug("SetPartComplete: could not update detail state for %s: %v", id, writeErr)
@@ -569,7 +575,23 @@ func SetPartComplete(id string, index int) error {
 		}
 	}
 
-	return saveMasterListLocked(list)
+	list, err := loadMasterListUnlocked()
+	if err != nil {
+		return err
+	}
+
+	for i := range list.Downloads {
+		if list.Downloads[i].ID != id {
+			continue
+		}
+		if index >= len(list.Downloads[i].Parts) {
+			return fmt.Errorf("%w: part %d of %s", types.ErrNotFound, index, id)
+		}
+		list.Downloads[i].Parts[index].Complete = true
+		return saveMasterListLocked(list)
+	}
+
+	return fmt.Errorf("%w: %s", types.ErrNotFound, id)
 }
 
 func PauseAllDownloads() error {
