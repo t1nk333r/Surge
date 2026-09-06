@@ -133,6 +133,38 @@ func TestEnsureAuthToken_CreatesTokenFile(t *testing.T) {
 	}
 }
 
+func TestMirrorTokenToRuntime_OwnerOnlyModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping: POSIX modes")
+	}
+	isolateTokenEnv(t)
+	require.NoError(t, config.EnsureDirs())
+
+	runtimeDir := resolveRuntimeDir()
+	runtimeToken := filepath.Join(runtimeDir, "token")
+
+	// Simulate the world-readable copy older Surge versions left behind.
+	require.NoError(t, os.MkdirAll(runtimeDir, 0o755))
+	require.NoError(t, os.Chmod(runtimeDir, 0o755))
+	require.NoError(t, os.WriteFile(runtimeToken, []byte("stale"), 0o644))
+
+	mirrorTokenToRuntime("runtime-mirror-token")
+
+	data, err := os.ReadFile(runtimeToken)
+	require.NoError(t, err)
+	assert.Equal(t, "runtime-mirror-token", strings.TrimSpace(string(data)))
+
+	info, err := os.Stat(runtimeToken)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
+		"the runtime token mirror must only be readable by its owner")
+
+	dirInfo, err := os.Stat(runtimeDir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), dirInfo.Mode().Perm(),
+		"the runtime dir holding the token must only be traversable by its owner")
+}
+
 func TestEnsureAuthToken_ReadsExistingToken(t *testing.T) {
 	if isElevated() {
 		t.Skip("skipping: test process is running as root")

@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -135,16 +137,64 @@ func startHTTPServer(ln net.Listener, port int, defaultOutputDir string, service
 	}
 }
 
+// allowedCORSSchemes are the browser-extension origin schemes that may read
+// Surge's API cross-origin.  The Surge extension's background worker is the
+// only intended cross-origin client.
+var allowedCORSSchemes = [...]string{"chrome-extension", "moz-extension", "safari-web-extension"}
+
+// isAllowedCORSOrigin reports whether origin is permitted to read API
+// responses cross-origin: a browser-extension origin, or a loopback origin
+// (a locally served UI).  Every other origin — i.e. any web page the user
+// happens to visit — gets no CORS headers at all, so the browser refuses to
+// expose even the fact that the server answered.
+func isAllowedCORSOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	// An Origin serialization is scheme://host[:port] and nothing else;
+	// anything carrying a path, query, fragment or userinfo is not one.
+	if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return false
+	}
+
+	for _, scheme := range allowedCORSSchemes {
+		if u.Scheme == scheme {
+			return true
+		}
+	}
+
+	if u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PUT, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Access-Control-Allow-Private-Network")
-		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		origin := r.Header.Get("Origin")
+		allowed := origin != "" && isAllowedCORSOrigin(origin)
 
-		// Handle preflight requests
-		if r.Method == "OPTIONS" {
+		if allowed {
+			header := w.Header()
+			header.Set("Access-Control-Allow-Origin", origin)
+			// The response body depends on the request Origin, so it must not
+			// be reused across origins by any cache.
+			header.Add("Vary", "Origin")
+		}
+
+		// Preflights are unauthenticated by necessity (browsers never attach the
+		// bearer token to them) and therefore always terminate here: they must
+		// not reach a route handler that could mutate state.
+		if r.Method == http.MethodOptions {
+			if allowed {
+				header := w.Header()
+				header.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS, PUT, PATCH")
+				header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Cache-Control, X-Requested-With")
+				header.Set("Access-Control-Allow-Private-Network", "true")
+				header.Set("Access-Control-Max-Age", "600")
+			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -153,30 +203,54 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// authenticatedContextKey marks a request that arrived with a valid bearer
+// token.  Only /health needs this: it answers unauthenticated callers too, but
+// reveals strictly less to them.
+type authenticatedContextKey struct{}
+
+// requestAuthenticated reports whether authMiddleware verified this request's
+// bearer token.
+func requestAuthenticated(r *http.Request) bool {
+	authenticated, _ := r.Context().Value(authenticatedContextKey{}).(bool)
+	return authenticated
+}
+
+// hasValidBearer compares the request's bearer credential against token in
+// constant time.
+func hasValidBearer(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+	provided := authHeader[len(prefix):]
+	return len(provided) == len(token) && subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+}
+
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Allow health check without auth
+		authenticated := hasValidBearer(r, token)
+
+		// /health stays open: the CLI and the extension use it to discover a
+		// running server before they know the token.  The handler tailors its
+		// payload to what the caller has proven.
 		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Allow OPTIONS for CORS preflight
-		if r.Method == "OPTIONS" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Check for Authorization header
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "" {
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				providedToken := strings.TrimPrefix(authHeader, "Bearer ")
-				if len(providedToken) == len(token) && subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) == 1 {
-					next.ServeHTTP(w, r)
-					return
-				}
+			if authenticated {
+				r = r.WithContext(context.WithValue(r.Context(), authenticatedContextKey{}, true))
 			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// No OPTIONS exemption here on purpose: corsMiddleware wraps this one and
+		// already answers every preflight, so an OPTIONS request reaching this
+		// point would mean the chain was rewired and must not bypass auth.
+		if authenticated {
+			next.ServeHTTP(w, r)
+			return
 		}
 
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -250,13 +324,22 @@ func writeTokenToFile(path string, token string) error {
 	return os.WriteFile(path, []byte(token), 0o600)
 }
 
-// mirrorTokenToRuntime writes a 0644 copy of the token to the runtime dir
-// so that local CLI clients can auto-discover and connect without needing sudo.
+// mirrorTokenToRuntime writes an owner-only copy of the token to the runtime
+// dir so that local CLI clients can auto-discover and connect without needing
+// sudo. Same-uid readers are unaffected by 0600; the mode matters because
+// GetRuntimeDir falls back to $XDG_STATE_HOME/surge/runtime when
+// XDG_RUNTIME_DIR is unset, i.e. outside the 0700 /run/user/<uid> tree.
 func mirrorTokenToRuntime(token string) {
 	runtimeDir := resolveRuntimeDir()
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
 		return
 	}
+	// MkdirAll and WriteFile leave an existing dir/file mode alone, and older
+	// Surge versions created both world-readable.
+	_ = os.Chmod(runtimeDir, 0o700)
 	runtimeTokenFile := filepath.Join(runtimeDir, "token")
-	_ = os.WriteFile(runtimeTokenFile, []byte(token), 0o644)
+	if err := os.WriteFile(runtimeTokenFile, []byte(token), 0o600); err != nil {
+		return
+	}
+	_ = os.Chmod(runtimeTokenFile, 0o600)
 }

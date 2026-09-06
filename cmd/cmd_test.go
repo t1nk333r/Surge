@@ -162,7 +162,7 @@ func TestSaveAndRemoveActivePort(t *testing.T) {
 // corsMiddleware Tests
 // =============================================================================
 
-func TestCorsMiddleware_SetsCORSHeaders(t *testing.T) {
+func TestCorsMiddleware_ReflectsExtensionOrigin(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -170,11 +170,12 @@ func TestCorsMiddleware_SetsCORSHeaders(t *testing.T) {
 	corsHandler := corsMiddleware(handler)
 
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", testExtensionOrigin)
 	rec := httptest.NewRecorder()
 	corsHandler.ServeHTTP(rec, req)
 
-	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
-		t.Error("CORS headers should be set for extension support")
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != testExtensionOrigin {
+		t.Errorf("Extension origin should be reflected for extension support, got %q", got)
 	}
 }
 
@@ -1019,9 +1020,14 @@ func TestStartHTTPServer_HealthEndpoint(t *testing.T) {
 			_ = globalHTTPServer.Close()
 		}
 	})
-
-	// Test health endpoint
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	// Test health endpoint.  The port is only disclosed to an authenticated
+	// caller, so this request carries the bearer token.
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/health", port), nil)
+	if err != nil {
+		t.Fatalf("Failed to build request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testHTTPServerToken)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to get health: %v", err)
 	}
@@ -1062,14 +1068,19 @@ func TestStartHTTPServer_HasCORSHeaders(t *testing.T) {
 			_ = globalHTTPServer.Close()
 		}
 	})
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/health", port), nil)
+	if err != nil {
+		t.Fatalf("Failed to build request: %v", err)
+	}
+	req.Header.Set("Origin", testExtensionOrigin)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
-		t.Error("CORS headers should be set for extension support")
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != testExtensionOrigin {
+		t.Errorf("CORS headers should be set for extension support, got %q", got)
 	}
 }
 
@@ -1314,10 +1325,11 @@ func TestCorsMiddleware_AllMethods(t *testing.T) {
 	methods := []string{"GET", "POST", "PUT", "DELETE", "PATCH"}
 	for _, method := range methods {
 		req := httptest.NewRequest(method, "/test", nil)
+		req.Header.Set("Origin", testExtensionOrigin)
 		rec := httptest.NewRecorder()
 		corsHandler.ServeHTTP(rec, req)
 
-		if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		if rec.Header().Get("Access-Control-Allow-Origin") != testExtensionOrigin {
 			t.Errorf("CORS header should be set for %s (required for extension support)", method)
 		}
 	}

@@ -125,14 +125,21 @@ jobs:
           fi
           echo "PASS: Bearer auth"
 
-          # 4. CORS headers (extension cross-origin fetch)
+          # 4. CORS headers: reflected for extension origins, absent for the web
           echo "--- Testing CORS headers ---"
-          RESP_HEADERS=$(curl -si http://127.0.0.1:1700/health)
-          echo "$RESP_HEADERS" | grep -qi "Access-Control-Allow-Origin: \*" || {
-            echo "FAIL: Missing CORS headers"
+          EXT_ORIGIN="chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          RESP_HEADERS=$(curl -si -H "Origin: $EXT_ORIGIN" http://127.0.0.1:1700/health)
+          echo "$RESP_HEADERS" | grep -qi "Access-Control-Allow-Origin: $EXT_ORIGIN" || {
+            echo "FAIL: extension origin was not allowed"
             echo "$RESP_HEADERS"
             exit 1
           }
+          PUBLIC_HEADERS=$(curl -si -H "Origin: https://evil.example" http://127.0.0.1:1700/health)
+          if echo "$PUBLIC_HEADERS" | grep -qi "Access-Control-Allow-Origin"; then
+            echo "FAIL: public web origin must not receive CORS headers"
+            echo "$PUBLIC_HEADERS"
+            exit 1
+          fi
           echo "PASS: CORS headers"
 
           # 5. Download request from extension (POST /download)

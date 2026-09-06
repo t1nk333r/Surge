@@ -29,12 +29,19 @@ type rateLimitSettingsService interface {
 }
 
 func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, service service.DownloadService) {
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		payload := map[string]interface{}{
 			"status": "ok",
-			"port":   port,
 			"mode":   activeServerMode,
-		})
+		}
+		// The listening port is only actionable for a caller that can already
+		// talk to the API.  Unauthenticated callers include any web page the
+		// user visits, so they get liveness only — they must not be able to
+		// learn which port Surge is on.
+		if requestAuthenticated(r) {
+			payload["port"] = port
+		}
+		writeJSONResponse(w, http.StatusOK, payload)
 	})
 
 	mux.HandleFunc("/events", eventsHandler(service))
@@ -296,7 +303,9 @@ func eventsHandler(service service.DownloadService) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// No Access-Control-Allow-Origin here: corsMiddleware already sets it for
+		// the origins allowed to read the stream, and overriding it with a
+		// wildcard would hand the event feed to every page the user visits.
 
 		stream, cleanup, err := service.StreamEvents(r.Context())
 		if err != nil {
