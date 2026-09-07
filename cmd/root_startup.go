@@ -35,21 +35,14 @@ func runStartupIntegrityCheck() string {
 	return ""
 }
 
-// initializeGlobalState sets up the environment and configures the engine state and logging
+// initializeGlobalState sets up the environment for a process that hosts the
+// engine (the TUI and `surge server`): the store, and a debug log of its own.
 func initializeGlobalState() error {
-	stateDir := config.GetStateDir()
-	logsDir := config.GetLogsDir()
-	stateDBPath := filepath.Join(stateDir, "surge.db")
-
-	if err := config.EnsureDirs(); err != nil {
-		return fmt.Errorf("failed to create surge directories: %w", err)
+	if err := initializeClientState(); err != nil {
+		return err
 	}
 
-	// Config engine state
-	store.Configure(stateDBPath)
-
-	// Config logging
-	utils.ConfigureDebug(logsDir)
+	utils.ConfigureDebug(config.GetLogsDir())
 	utils.Debug("Surge %s (commit %s)", Version, Commit)
 
 	// Clean up old logs (keeping retention-1 because a new log will be created immediately after)
@@ -59,6 +52,19 @@ func initializeGlobalState() error {
 	} else {
 		utils.CleanupLogs(retention)
 	}
+	return nil
+}
+
+// initializeClientState is the subset a thin client command needs: the
+// directories, the store and the settings. It deliberately does not open a
+// debug log. A client such as `surge ls` runs once per poll from the desktop
+// widget, and a log file per invocation would rotate the server's own log
+// out of the retention window within seconds.
+func initializeClientState() error {
+	if err := config.EnsureDirs(); err != nil {
+		return fmt.Errorf("failed to create surge directories: %w", err)
+	}
+	store.Configure(filepath.Join(config.GetStateDir(), "surge.db"))
 	return nil
 }
 

@@ -13,8 +13,8 @@ var addCmd = &cobra.Command{
 	Short:   "Add a new download to the running Surge instance",
 	Long:    `Add one or more URLs to the download queue of a running Surge instance.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		//initializeGlobally is required to ensure that the config and logger are set up before we attempt to resolve the API connection or read the batch file.
-		if err := initializeGlobalState(); err != nil {
+		// The store and settings must be configured before the API connection is resolved or the batch file read.
+		if err := initializeClientState(); err != nil {
 			return err
 		}
 

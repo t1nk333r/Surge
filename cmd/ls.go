@@ -22,7 +22,7 @@ var lsCmd = &cobra.Command{
 	Long:    `List all downloads from the running server or database. Optionally show details for a specific download by ID.`,
 	Args:    cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := initializeGlobalState(); err != nil {
+		if err := initializeClientState(); err != nil {
 			return err
 		}
 

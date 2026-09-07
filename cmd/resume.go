@@ -13,7 +13,7 @@ var resumeCmd = &cobra.Command{
 	Long:  `Resume a paused download by its ID. Use --all to resume all paused downloads.`,
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := initializeGlobalState(); err != nil {
+		if err := initializeClientState(); err != nil {
 			return err
 		}
 

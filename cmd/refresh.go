@@ -17,7 +17,7 @@ var refreshCmd = &cobra.Command{
 	Long:  `Update the source URL of a download by its ID. It must be paused or in an error state to be refreshed.`,
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := initializeGlobalState(); err != nil {
+		if err := initializeClientState(); err != nil {
 			return err
 		}
 
