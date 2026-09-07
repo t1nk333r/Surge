@@ -17,6 +17,15 @@
 
 ---
 
+> **This is a fork.** `t1nk333r/Surge` tracks [SurgeDM/Surge](https://github.com/SurgeDM/Surge)
+> by rebase and carries changes that are not upstreamed and are not offered as
+> pull requests: a locked-down CORS policy, an Omarchy bar-widget plugin with a
+> hardened systemd user unit, and media support (YouTube-style pages, separate
+> video+audio streams joined with ffmpeg, and HLS playlists) downloaded through
+> Surge's own engine. See [docs/USAGE.md](docs/USAGE.md#media-pages-youtube-and-friends)
+> and [docs/DESKTOP_INTEGRATION.md](docs/DESKTOP_INTEGRATION.md). Bugs in those
+> areas belong here, not upstream.
+
 ## What is Surge?
 
 Surge is designed for power users who prefer a keyboard-driven workflow. It features a beautiful **Terminal User Interface (TUI)**, as well as a background **Headless Server** and a **CLI tool** for automation.
