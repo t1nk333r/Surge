@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/SurgeDM/Surge/internal/config"
 	"github.com/SurgeDM/Surge/internal/orchestrator"
@@ -155,7 +157,7 @@ func TestResolveDownloadID_LocalModeFallsBackToDBWhenRemoteListFails(t *testing.
 
 	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/list" {
-			http.Error(w, "boom", http.StatusInternalServerError)
+			http.Error(w, "boom", http.StatusServiceUnavailable)
 			return
 		}
 		http.NotFound(w, r)
@@ -415,7 +417,9 @@ func TestPrintDownloadDetail_TextAndJSON(t *testing.T) {
 	}
 
 	textOut := captureStdout(t, func() {
-		printDownloadDetail(status, false)
+		if err := printDownloadDetail(os.Stdout, status, false); err != nil {
+			t.Fatal(err)
+		}
 	})
 	if !strings.Contains(textOut, "ID:         "+status.ID) {
 		t.Fatalf("expected text output to contain ID, got: %s", textOut)
@@ -428,7 +432,9 @@ func TestPrintDownloadDetail_TextAndJSON(t *testing.T) {
 	}
 
 	jsonOut := captureStdout(t, func() {
-		printDownloadDetail(status, true)
+		if err := printDownloadDetail(os.Stdout, status, true); err != nil {
+			t.Fatal(err)
+		}
 	})
 	var decoded types.DownloadStatus
 	if err := json.Unmarshal([]byte(jsonOut), &decoded); err != nil {
@@ -558,6 +564,180 @@ func TestActionCommandsRunE_ReturnNoServerErrors(t *testing.T) {
 	}
 }
 
+func TestRefreshCommand_ValidatesURLBeforeConnecting(t *testing.T) {
+	setupIsolatedCmdState(t)
+	resetCommandConnectionState(t)
+
+	var requestCount int32
+	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	_, portString, _ := net.SplitHostPort(server.Listener.Addr().String())
+	var port int
+	_, _ = fmt.Sscanf(portString, "%d", &port)
+	saveActivePort(port)
+	t.Cleanup(removeActivePort)
+
+	err := refreshCmd.RunE(refreshCmd, []string{"deadbeef", "https://:443/file.zip"})
+	if err == nil {
+		t.Fatal("expected invalid URL error")
+	}
+	if !strings.Contains(err.Error(), "invalid replacement URL: missing host") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 0 {
+		t.Fatalf("server received %d requests for invalid URL", got)
+	}
+}
+
+func TestRefreshCommand_NormalizesURLAndReportsServerErrors(t *testing.T) {
+	setupIsolatedCmdState(t)
+	resetCommandConnectionState(t)
+
+	const downloadID = "aabbccdd-1234-5678-90ab-cdef12345678"
+	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/list":
+			_ = json.NewEncoder(w).Encode([]types.DownloadStatus{{ID: downloadID}})
+		case "/update-url":
+			if r.Method != http.MethodPut {
+				t.Fatalf("update method = %s, want PUT", r.Method)
+			}
+			if got := r.URL.Query().Get("id"); got != downloadID {
+				t.Fatalf("update id = %q, want %q", got, downloadID)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if got := body["url"]; got != "https://example.com/replacement.zip" {
+				t.Fatalf("update URL = %q", got)
+			}
+			http.Error(w, "download is active", http.StatusConflict)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, portString, _ := net.SplitHostPort(server.Listener.Addr().String())
+	var port int
+	_, _ = fmt.Sscanf(portString, "%d", &port)
+	saveActivePort(port)
+	t.Cleanup(removeActivePort)
+
+	originalToken := globalToken
+	globalToken = "test-token"
+	t.Cleanup(func() { globalToken = originalToken })
+
+	err := refreshCmd.RunE(refreshCmd, []string{"aabbccdd", "example.com/replacement.zip"})
+	if err == nil {
+		t.Fatal("expected server error")
+	}
+	if !strings.Contains(err.Error(), "409 Conflict - download is active") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPauseAllDownloads(t *testing.T) {
+	setupIsolatedCmdState(t)
+	resetCommandConnectionState(t)
+
+	statuses := []types.DownloadStatus{
+		{ID: "queued-id", Status: "queued"},
+		{ID: "active-id", Status: "downloading"},
+		{ID: "complete-id", Status: "completed"},
+	}
+	pausedIDs := make(map[string]bool)
+	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/list":
+			if r.Method != http.MethodGet {
+				t.Fatalf("list method = %s, want GET", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(statuses)
+		case "/pause":
+			if r.Method != http.MethodPost {
+				t.Fatalf("pause method = %s, want POST", r.Method)
+			}
+			pausedIDs[r.URL.Query().Get("id")] = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, portStr, _ := net.SplitHostPort(server.Listener.Addr().String())
+	var port int
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
+	saveActivePort(port)
+	t.Cleanup(removeActivePort)
+
+	origToken := globalToken
+	globalToken = "test-token"
+	t.Cleanup(func() { globalToken = origToken })
+
+	if err := runLifecycleAll(context.Background(), pauseCmd, "pause"); err != nil {
+		t.Fatalf("pauseAllDownloads() error = %v", err)
+	}
+	if !pausedIDs["active-id"] || !pausedIDs["queued-id"] || pausedIDs["complete-id"] {
+		t.Fatalf("paused IDs = %#v, want only active-id and queued-id", pausedIDs)
+	}
+}
+
+func TestResumeAllDownloads(t *testing.T) {
+	setupIsolatedCmdState(t)
+	resetCommandConnectionState(t)
+
+	statuses := []types.DownloadStatus{
+		{ID: "paused-z", Status: "paused"},
+		{ID: "active-id", Status: "downloading"},
+		{ID: "paused-a", Status: "paused"},
+		{ID: "complete-id", Status: "completed"},
+		{ID: "failed-id", Status: "error"},
+	}
+	var resumedIDs []string
+	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/list":
+			if r.Method != http.MethodGet {
+				t.Fatalf("list method = %s, want GET", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(statuses)
+		case "/resume":
+			if r.Method != http.MethodPost {
+				t.Fatalf("resume method = %s, want POST", r.Method)
+			}
+			resumedIDs = append(resumedIDs, r.URL.Query().Get("id"))
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, portStr, _ := net.SplitHostPort(server.Listener.Addr().String())
+	var port int
+	_, _ = fmt.Sscanf(portStr, "%d", &port)
+	saveActivePort(port)
+	t.Cleanup(removeActivePort)
+
+	origToken := globalToken
+	globalToken = "test-token"
+	t.Cleanup(func() { globalToken = origToken })
+
+	if err := runLifecycleAll(context.Background(), resumeCmd, "resume"); err != nil {
+		t.Fatalf("resumeAllDownloads() error = %v", err)
+	}
+	if got, want := strings.Join(resumedIDs, ","), "paused-a,paused-z"; got != want {
+		t.Fatalf("resumed IDs = %q, want %q", got, want)
+	}
+}
+
 func TestConnectCmd_HostSourcesBypassLocalAutodetect(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -660,7 +840,7 @@ func TestActionCommandsRunE_ReturnAmbiguousIDErrors(t *testing.T) {
 
 			server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/list" {
-					http.Error(w, "boom", http.StatusInternalServerError)
+					http.Error(w, "boom", http.StatusServiceUnavailable)
 					return
 				}
 				http.NotFound(w, r)
@@ -691,7 +871,11 @@ func TestActionCommandsRunE_ReturnAmbiguousIDErrors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected %s command to return an ambiguous ID error", tt.name)
 			}
-			if !strings.Contains(err.Error(), "ambiguous ID prefix") {
+			want := "server returned HTTP" // Mutations must resolve IDs against the live server only.
+			if tt.name == "rm" {
+				want = "ambiguous ID prefix"
+			}
+			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("unexpected %s error: %v", tt.name, err)
 			}
 		})
@@ -715,7 +899,7 @@ func TestPrintDownloads_FromDatabase_TableAndJSON(t *testing.T) {
 	}
 
 	tableOut := captureStdout(t, func() {
-		if err := printDownloads(false, "", "", false); err != nil {
+		if err := printDownloads(os.Stdout, false, "", "", false); err != nil {
 			t.Fatalf("printDownloads table failed: %v", err)
 		}
 	})
@@ -733,7 +917,7 @@ func TestPrintDownloads_FromDatabase_TableAndJSON(t *testing.T) {
 	}
 
 	jsonOut := captureStdout(t, func() {
-		if err := printDownloads(true, "", "", false); err != nil {
+		if err := printDownloads(os.Stdout, true, "", "", false); err != nil {
 			t.Fatalf("printDownloads json failed: %v", err)
 		}
 	})
@@ -755,7 +939,7 @@ func TestPrintDownloads_JSONEmpty(t *testing.T) {
 	removeActivePort()
 
 	out := captureStdout(t, func() {
-		if err := printDownloads(true, "", "", false); err != nil {
+		if err := printDownloads(os.Stdout, true, "", "", false); err != nil {
 			t.Fatalf("printDownloads empty json failed: %v", err)
 		}
 	})
@@ -765,6 +949,69 @@ func TestPrintDownloads_JSONEmpty(t *testing.T) {
 	}
 	if len(infos) != 0 {
 		t.Fatalf("expected empty json array, got %d entries: %+v", len(infos), infos)
+	}
+}
+
+func TestStatusFromRecordPreservesOfflineDetails(t *testing.T) {
+	record := types.DownloadRecord{
+		ID:           "completed-without-size",
+		URL:          "https://example.com/archive.zip",
+		Filename:     "archive.zip",
+		DestPath:     "/downloads/archive.zip",
+		Status:       "completed",
+		Downloaded:   1024,
+		Error:        "previous failure",
+		CreatedAt:    1234567890,
+		TimeTaken:    12,
+		AvgSpeed:     85.5,
+		RateLimit:    1024,
+		RateLimitSet: true,
+	}
+
+	status := statusFromRecord(record)
+	if status.Progress != 100 {
+		t.Errorf("completed download without a known size has progress %v, want 100", status.Progress)
+	}
+	if status.URL != record.URL || status.DestPath != record.DestPath || status.Error != record.Error || status.AddedAt != record.CreatedAt || status.TimeTaken != record.TimeTaken || status.AvgSpeed != record.AvgSpeed || status.RateLimit != record.RateLimit || status.RateLimitSet != record.RateLimitSet {
+		t.Errorf("statusFromRecord lost offline details: %+v", status)
+	}
+
+	info := downloadInfoFromStatus(status)
+	if info.URL != record.URL {
+		t.Errorf("downloadInfo URL = %q, want %q", info.URL, record.URL)
+	}
+}
+
+func TestTruncateFilenameForDisplayPreservesUTF8(t *testing.T) {
+	filename := strings.Repeat("文", 26)
+	got := truncateFilenameForDisplay(filename, 25)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncated filename is invalid UTF-8: %q", got)
+	}
+	if utf8.RuneCountInString(got) != 25 || !strings.HasSuffix(got, "...") {
+		t.Errorf("truncated filename = %q, want 25 runes ending in ellipsis", got)
+	}
+}
+
+func TestValidateLSFlags(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		argCount   int
+		jsonOutput bool
+		watch      bool
+		wantErr    bool
+	}{
+		{name: "normal list"},
+		{name: "watch list", watch: true},
+		{name: "watch JSON", jsonOutput: true, watch: true, wantErr: true},
+		{name: "watch detail", argCount: 1, watch: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateLSFlags(test.argCount, test.jsonOutput, test.watch)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateLSFlags() error = %v, want error=%v", err, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -791,7 +1038,7 @@ func TestPrintDownloads_StrictRemoteEmpty_DoesNotFallbackToDB(t *testing.T) {
 	defer server.Close()
 
 	out := captureStdout(t, func() {
-		if err := printDownloads(true, server.URL, "", true); err != nil {
+		if err := printDownloads(os.Stdout, true, server.URL, "", true); err != nil {
 			t.Fatalf("printDownloads strict remote failed: %v", err)
 		}
 	})
@@ -840,7 +1087,7 @@ func TestShowDownloadDetails_UsesDatabaseFallback(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := showDownloadDetails("87654321", true, "", "", false); err != nil {
+		if err := showDownloadDetails(os.Stdout, "87654321", true, "", ""); err != nil {
 			t.Fatalf("showDownloadDetails fallback failed: %v", err)
 		}
 	})
@@ -859,12 +1106,14 @@ func TestShowDownloadDetails_UsesDatabaseFallback(t *testing.T) {
 
 func TestSendToServer_SuccessAndServerError(t *testing.T) {
 	tests := []struct {
-		name       string
-		statusCode int
-		body       string
-		wantErr    bool
+		name        string
+		statusCode  int
+		body        string
+		wantPending bool
+		wantErr     bool
 	}{
-		{name: "success accepted", statusCode: http.StatusAccepted, body: `{"id":"abc"}`},
+		{name: "success queued", statusCode: http.StatusOK, body: `{"id":"abc"}`},
+		{name: "success pending approval", statusCode: http.StatusAccepted, body: `{"id":"abc"}`, wantPending: true},
 		{name: "server error", statusCode: http.StatusInternalServerError, body: "boom", wantErr: true},
 	}
 
@@ -896,14 +1145,43 @@ func TestSendToServer_SuccessAndServerError(t *testing.T) {
 			})
 
 			port := ln.Addr().(*net.TCPAddr).Port
-			err = sendToServer("https://example.com/file.zip", nil, "", fmt.Sprintf("http://127.0.0.1:%d", port), "")
+			pending, err := sendToServerWithApproval("https://example.com/file.zip", nil, "", fmt.Sprintf("http://127.0.0.1:%d", port), "", false)
 			if tt.wantErr && err == nil {
 				t.Fatal("expected error, got nil")
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
+			if pending != tt.wantPending {
+				t.Fatalf("pending approval = %v, want %v", pending, tt.wantPending)
+			}
 		})
+	}
+}
+
+func TestSendBatchToServer_NormalizesURLs(t *testing.T) {
+	var requests int32
+	server := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		var req BatchDownloadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode batch request: %v", err)
+		}
+		if len(req.Downloads) != 1 || req.Downloads[0].URL != "https://example.com/file.zip" {
+			t.Fatalf("downloads = %#v, want normalized URL", req.Downloads)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	if err := sendBatchToServer([]string{"example.com/file.zip"}, "", server.URL, "", false); err != nil {
+		t.Fatalf("sendBatchToServer() error = %v", err)
+	}
+	if err := sendBatchToServer([]string{"ftp://example.com/file.zip"}, "", server.URL, "", false); err == nil {
+		t.Fatal("expected unsupported URL scheme to be rejected")
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests = %d, want 1; the invalid batch must not reach the server", got)
 	}
 }
 
@@ -1027,6 +1305,7 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 		port := ln.Addr().(*net.TCPAddr).Port
 		count := processDownloads([]string{
 			"https://example.com/a.zip,https://mirror.example.com/a.zip",
+			"ftp://example.com/unsupported.zip",
 			"",
 			"https://example.com/b.zip",
 		}, "", port)
@@ -1041,7 +1320,6 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 
 	t.Run("local-mode", func(t *testing.T) {
 		setupIsolatedCmdState(t)
-		atomic.StoreInt32(&activeDownloads, 0)
 
 		GlobalProgressCh = make(chan types.DownloadEvent, 10)
 		if GlobalPool != nil {
@@ -1074,14 +1352,12 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 
 		count := processDownloads([]string{
 			probeServer.URL + "/local.zip",
+			"ftp://example.com/unsupported.zip",
 			"",
 		}, t.TempDir(), 0)
 
 		if count != 1 {
 			t.Fatalf("expected 1 successful local add, got %d", count)
-		}
-		if atomic.LoadInt32(&activeDownloads) != 1 {
-			t.Fatalf("expected activeDownloads=1, got %d", atomic.LoadInt32(&activeDownloads))
 		}
 	})
 }
@@ -1089,12 +1365,12 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 func setupIsolatedCmdState(t *testing.T) {
 	t.Helper()
 	origSettings := globalSettings
-	origCheck := checkSystemServiceRunning
-	checkSystemServiceRunning = func() bool { return false }
+	origCheck := checkUserServiceRunning
+	checkUserServiceRunning = func() bool { return false }
 
 	t.Cleanup(func() {
 		globalSettings = origSettings
-		checkSystemServiceRunning = origCheck
+		checkUserServiceRunning = origCheck
 		resetGlobalShutdownCoordinatorForTest(nil)
 	})
 

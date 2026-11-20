@@ -79,7 +79,14 @@ func (pa *ProgressAggregator) reportProgressLoop() {
 		case <-ticker.C:
 		}
 
-		if pa.pool == nil {
+		if pa.pool == nil || pa.eventBus == nil {
+			continue
+		}
+		if !pa.eventBus.HasObservers() {
+			clear(lastSpeeds)
+			clear(lastChunkSnapshot)
+			clear(lastDownloaded)
+			clear(lastUpdateTime)
 			continue
 		}
 		alpha := pa.getSpeedEmaAlpha()
@@ -123,7 +130,12 @@ func (pa *ProgressAggregator) reportProgressLoop() {
 			}
 			lastSpeeds[cfg.ID] = currentSpeed
 
-			msg := types.DownloadEvent{
+			phase := "downloading"
+			if progress.CfgProgress(&cfg).Verifying.Load() {
+				phase = "verifying"
+				currentSpeed = 0
+			}
+			msg := types.DownloadEvent{Phase: phase,
 				Type:        types.EventProgress,
 				DownloadID:  cfg.ID,
 				Downloaded:  downloaded,

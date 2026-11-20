@@ -11,6 +11,50 @@ import (
 	"charm.land/bubbles/v2/key"
 )
 
+func TestFilePickerHomeMigratesToShiftH(t *testing.T) {
+	for _, keys := range [][]string{{"h", "H"}, {"h", "shift+h"}, {"ctrl+h"}} {
+		cfg := &KeyMapConfig{FilePicker: map[string]KeyBindingConfig{"GotoHome": {Keys: keys}}}
+		km := DefaultKeyMap()
+		km.ApplyConfig(cfg)
+		want := []string{"H", "shift+h"}
+		if keys[0] == "ctrl+h" {
+			want = keys
+		}
+		if !reflect.DeepEqual(km.FilePicker.GotoHome.Keys(), want) {
+			t.Fatalf("home keys = %v, want %v", km.FilePicker.GotoHome.Keys(), want)
+		}
+		if !reflect.DeepEqual(cfg.FilePicker["GotoHome"].Keys, keys) {
+			t.Fatal("migration mutated source config")
+		}
+	}
+}
+
+func TestConfiguredArrowHelpUsesGlyphs(t *testing.T) {
+	km := DefaultKeyMap()
+	km.ApplyConfig(&KeyMapConfig{Settings: map[string]KeyBindingConfig{
+		"Up":      {Keys: []string{"up", "shift+up", "k"}},
+		"Down":    {Keys: []string{"down"}},
+		"PrevTab": {Keys: []string{"left", "h"}},
+		"NextTab": {Keys: []string{"right", "l"}},
+	}})
+	for _, check := range []struct {
+		binding key.Binding
+		want    string
+	}{
+		{km.Settings.Up, "\u2191/shift+\u2191/k"},
+		{km.Settings.Down, "\u2193"},
+		{km.Settings.PrevTab, "\u2190/h"},
+		{km.Settings.NextTab, "\u2192/l"},
+	} {
+		if got := check.binding.Help().Key; got != check.want {
+			t.Errorf("help = %q, want %q", got, check.want)
+		}
+	}
+	if !reflect.DeepEqual(km.Settings.Up.Keys(), []string{"up", "shift+up", "k"}) {
+		t.Fatal("display formatting changed functional keys")
+	}
+}
+
 func TestDefaultKeyMap(t *testing.T) {
 	km := DefaultKeyMap()
 	if km == nil {
@@ -37,6 +81,25 @@ func TestDefaultKeyMap(t *testing.T) {
 	}
 	if !foundOpenFolder {
 		t.Error("Dashboard.OpenFolder missing from FullHelp")
+	}
+}
+
+func TestSettingsResetBindingsMigrateLegacyShiftR(t *testing.T) {
+	cfg := &KeyMapConfig{Settings: map[string]KeyBindingConfig{"Reset": {Keys: []string{"r", "R"}, Help: "reset"}}}
+	km := DefaultKeyMap()
+	km.ApplyConfig(cfg)
+	if !reflect.DeepEqual(km.Settings.Reset.Keys(), []string{"r"}) || !reflect.DeepEqual(km.Settings.DeleteCategory.Keys(), []string{"d"}) {
+		t.Fatal("legacy selected-reset keys did not migrate")
+	}
+	if !reflect.DeepEqual(cfg.Settings["Reset"].Keys, []string{"r", "R"}) {
+		t.Fatal("migration mutated caller configuration")
+	}
+	if km.Settings.ResetAll.Help().Key != "shift+r" {
+		t.Fatal("reset all is not advertised as Shift+R")
+	}
+	km.ApplyConfig(&KeyMapConfig{Settings: map[string]KeyBindingConfig{"Reset": {Keys: []string{"ctrl+r"}}, "ResetAll": {Keys: []string{"ctrl+shift+r"}}, "DeleteCategory": {Keys: []string{"ctrl+d"}}}})
+	if km.Settings.Reset.Help().Key != "ctrl+r" || km.Settings.ResetAll.Help().Key != "ctrl+shift+r" || km.Settings.DeleteCategory.Help().Key != "ctrl+d" {
+		t.Fatal("explicit custom settings bindings were not preserved")
 	}
 }
 
@@ -207,5 +270,80 @@ func TestReportBugAndToggleHelpKeymaps(t *testing.T) {
 	}
 	if km.Settings.ReportBug.Help().Desc != "bug report" {
 		t.Errorf("Expected Settings.ReportBug help desc to be 'bug report', got %q", km.Settings.ReportBug.Help().Desc)
+	}
+}
+
+func TestLoadKeyMapMigratesFormerSettingsTabHelp(t *testing.T) {
+	for _, tc := range []struct {
+		tab, oldHelp, newHelp string
+	}{
+		{"Tab2", "network", "downloads"},
+		{"Tab3", "performance", "appearance"},
+		{"Tab4", "categories", "network"},
+		{"Tab5", "extension", "categories"},
+	} {
+		for _, custom := range []bool{false, true} {
+			name := tc.tab
+			if custom {
+				name += "/custom"
+			}
+			t.Run(name, func(t *testing.T) {
+				tmp := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", tmp)
+				t.Setenv("APPDATA", tmp)
+				if err := os.MkdirAll(GetSurgeDir(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				cfg := DefaultKeyMap().ToConfig()
+				binding := cfg.Settings[tc.tab]
+				binding.Keys = []string{"alt+9"}
+				binding.Help = tc.oldHelp
+				wantHelp := tc.newHelp
+				if custom {
+					binding.Help = "custom " + tc.oldHelp
+					wantHelp = binding.Help
+				}
+				// Binding names are accepted case-insensitively by ApplyConfig.
+				delete(cfg.Settings, tc.tab)
+				cfg.Settings[strings.ToLower(tc.tab)] = binding
+				data, err := json.MarshalIndent(cfg, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(GetKeyMapConfigPath(), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+
+				loaded, err := LoadKeyMap()
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := loaded.ToConfig().Settings[tc.tab]
+				if got.Help != wantHelp || !reflect.DeepEqual(got.Keys, binding.Keys) {
+					t.Fatalf("loaded binding = %+v, want help %q and keys %v", got, wantHelp, binding.Keys)
+				}
+				saved, err := os.ReadFile(GetKeyMapConfigPath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var persisted KeyMapConfig
+				if err := json.Unmarshal(saved, &persisted); err != nil {
+					t.Fatal(err)
+				}
+				if got := persisted.Settings[tc.tab]; got.Help != wantHelp || !reflect.DeepEqual(got.Keys, binding.Keys) {
+					t.Fatalf("persisted binding = %+v, want help %q and keys %v", got, wantHelp, binding.Keys)
+				}
+				if _, err := LoadKeyMap(); err != nil {
+					t.Fatal(err)
+				}
+				again, err := os.ReadFile(GetKeyMapConfigPath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(saved) != string(again) {
+					t.Fatal("keymap changed on second load")
+				}
+			})
+		}
 	}
 }

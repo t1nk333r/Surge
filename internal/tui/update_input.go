@@ -113,6 +113,7 @@ func (m RootModel) submitInputForm() (tea.Model, tea.Cmd) {
 	headers := m.pendingHeaders
 
 	if d := m.checkForDuplicate(url); d != nil {
+		m.pendingDownloadID = ""
 		m.pendingURL = url
 		m.pendingMirrors = mirrors
 		m.pendingHeaders = headers
@@ -182,15 +183,17 @@ func (m RootModel) updateExtensionConfirmation(msg tea.KeyPressMsg) (tea.Model, 
 			m.pendingPath = m.defaultDownloadPath()
 		}
 
-		if d := m.checkForDuplicate(m.pendingURL); d != nil {
-			utils.Debug("Duplicate download detected after confirmation: %s", m.pendingURL)
-			m.duplicateInfo = d.Filename
-			m.state = DuplicateWarningState
-			return m, nil
+		if !m.pendingSkipDuplicateWarning {
+			if d := m.checkForDuplicate(m.pendingURL); d != nil {
+				utils.Debug("Duplicate download detected after confirmation for host %s", utils.URLHostForLog(m.pendingURL))
+				m.duplicateInfo = d.Filename
+				m.state = DuplicateWarningState
+				return m, nil
+			}
 		}
 
 		m.state = DashboardState
-		updated, cmd := m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, "", m.pendingWorkers, m.pendingMinChunkSize)
+		updated, cmd := m.startDownload(m.pendingURL, m.pendingMirrors, m.pendingHeaders, m.pendingPath, m.pendingIsDefaultPath, m.pendingFilename, m.pendingDownloadID, m.pendingWorkers, m.pendingMinChunkSize)
 		nextModel, nextCmd := updated.showNextPendingRequest()
 		return nextModel, tea.Batch(cmd, nextCmd)
 	}

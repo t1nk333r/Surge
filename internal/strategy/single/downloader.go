@@ -20,13 +20,37 @@ import (
 // NOTE: Pause/resume is NOT supported because this downloader is only used when
 // the server doesn't support Range headers. If interrupted, the download must restart.
 type SingleDownloader struct {
-	ProgressChan chan<- types.DownloadEvent // Channel for events (start/complete/error)
-	ID           string                     // Download ID
-	State        *progress.DownloadProgress // Shared state for TUI polling
-	Runtime      *types.RuntimeConfig
-	Limiter      types.ByteLimiter
-	TotalSize    int64
-	Headers      map[string]string // Custom HTTP headers (cookies, auth, etc.)
+	ProgressChan         chan<- types.DownloadEvent // Channel for events (start/complete/error)
+	ID                   string                     // Download ID
+	State                *progress.DownloadProgress // Shared state for TUI polling
+	Runtime              *types.RuntimeConfig
+	Limiter              types.ByteLimiter
+	TotalSize            int64
+	Headers              map[string]string // Custom HTTP headers (cookies, auth, etc.)
+	throttleEpisodeStart time.Time
+}
+
+func (d *SingleDownloader) ImportThrottleState(cfg *types.DownloadRecord) {
+	if cfg != nil {
+		d.throttleEpisodeStart = cfg.ThrottleEpisodeStart
+	}
+}
+
+func (d *SingleDownloader) ExportThrottleState(cfg *types.DownloadRecord) {
+	if cfg != nil {
+		cfg.ThrottleEpisodeStart = d.throttleEpisodeStart
+	}
+}
+
+func (d *SingleDownloader) checkThrottleBudget(now time.Time, wait time.Duration) error {
+	if d.throttleEpisodeStart.IsZero() {
+		d.throttleEpisodeStart = now
+	}
+	remaining := 10*time.Minute - now.Sub(d.throttleEpisodeStart)
+	if remaining <= 0 || wait > remaining {
+		return fmt.Errorf("host cooldown %v exceeds remaining throttle budget %v: %w", wait, remaining, types.ErrRetryBudgetExceeded)
+	}
+	return nil
 }
 
 var bufPool = sync.Pool{
@@ -91,20 +115,43 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 			return nil, err
 		}
 		for key, val := range d.Headers {
-			if strings.EqualFold(key, "Range") {
+			if strings.EqualFold(key, "Range") || strings.EqualFold(key, "Accept-Encoding") {
 				continue
 			}
 			req.Header.Set(key, val)
 		}
-		req.Header.Set("User-Agent", d.Runtime.GetUserAgent())
+		// Keep a forwarded browser User-Agent so it matches the other browser headers.
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", d.Runtime.GetUserAgent())
+		}
+		// The transport does not decompress, so ask for the raw bytes.
+		req.Header.Set("Accept-Encoding", "identity")
 		return req, nil
 	}
 
 	var resp *http.Response
 	const maxRlRetries = types.RateLimitMaxRetries
 	rlRetries := 0
+	host := transport.MirrorHost(rawurl)
+	if d.State != nil {
+		defer d.State.RateLimited.Store(false)
+	}
 
 	for {
+		if until := transport.DefaultHostRateLimiter.BlockedUntil(host, time.Now()); !until.IsZero() {
+			if err := d.checkThrottleBudget(time.Now(), time.Until(until)); err != nil {
+				return err
+			}
+			if d.State != nil {
+				d.State.RateLimited.Store(true)
+			}
+			select {
+			case <-dlCtx.Done():
+				return dlCtx.Err()
+			case <-time.After(time.Until(until)):
+			}
+			continue
+		}
 		req, err := buildRequest()
 		if err != nil {
 			return err
@@ -112,7 +159,7 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 
 		resp, err = client.Do(req)
 		if err != nil {
-			utils.Debug("Single downloader: GET %s failed: %v", rawurl, err)
+			utils.Debug("Single downloader: GET host %s failed", utils.URLHostForLog(rawurl))
 			return err
 		}
 
@@ -121,18 +168,21 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests ||
-			(resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "") {
+			resp.StatusCode == http.StatusServiceUnavailable {
 			_ = resp.Body.Close()
+			now := time.Now()
+			ra, explicit := transport.ParseRetryAfter(resp.Header.Get("Retry-After"), now)
+			until := transport.DefaultHostRateLimiter.Penalize(host, ra, explicit, now)
+			ra = time.Until(until)
+			if err := d.checkThrottleBudget(now, ra); err != nil {
+				return err
+			}
 			rlRetries++
 			if rlRetries > maxRlRetries {
-				utils.Debug("Single downloader: rate limited after %d retries for %s", maxRlRetries, rawurl)
+				utils.Debug("Single downloader: rate limited after %d retries for host %s", maxRlRetries, utils.URLHostForLog(rawurl))
 				return fmt.Errorf("rate limited after %d retries: %d", maxRlRetries, resp.StatusCode)
 			}
 
-			ra, _ := transport.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-			if ra <= 0 {
-				ra = 5 * time.Second
-			}
 			utils.Debug("Single downloader: rate limited (%d), waiting %v (retry %d/%d)", resp.StatusCode, ra, rlRetries, maxRlRetries)
 			if d.State != nil {
 				d.State.RateLimited.Store(true)
@@ -149,7 +199,7 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 		}
 
 		_ = resp.Body.Close()
-		utils.Debug("Single downloader: unexpected status %d for %s", resp.StatusCode, rawurl)
+		utils.Debug("Single downloader: unexpected status %d for host %s", resp.StatusCode, utils.URLHostForLog(rawurl))
 		if types.IsPermanentHTTPStatus(resp.StatusCode) {
 			return fmt.Errorf("unexpected status code: %d: %w", resp.StatusCode, types.ErrPermanentHTTP)
 		}
@@ -209,11 +259,14 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 		written, err = io.CopyBuffer(outFile, progressReader, buf)
 		progressReader.Flush()
 	}
+	if written > 0 {
+		d.throttleEpisodeStart = time.Time{}
+	}
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		utils.Debug("Single downloader: copy error for %s: %v", rawurl, err)
+		utils.Debug("Single downloader: copy error for host %s: %v", utils.URLHostForLog(rawurl), err)
 		return fmt.Errorf("copy error: %w", err)
 	}
 
@@ -225,6 +278,13 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 
 	if err := outFile.Sync(); err != nil {
 		return fmt.Errorf("sync error: %w", err)
+	}
+
+	if d.TotalSize <= 0 {
+		d.TotalSize = written
+		if d.State != nil {
+			d.State.Bytes.SetTotalSize(written)
+		}
 	}
 
 	if d.State != nil {

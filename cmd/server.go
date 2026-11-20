@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,21 +28,22 @@ var serverCmd = &cobra.Command{
 	},
 }
 
-var isSystemServiceFlag bool
+var managedServiceFlag bool
 
 var serverStartCmd = &cobra.Command{
 	Use:   "start [url]...",
 	Short: "Start the Surge server in headless mode",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if isSystemServiceFlag {
+		if managedServiceFlag {
 			activeServerMode = "service"
+			detachConsole()
 		}
-		if checkSystemServiceRunning() && !isSystemServiceFlag {
-			return fmt.Errorf("system service is already running. Use 'surge connect' to interact with it, or stop the service first")
+		if checkUserServiceRunning() && !managedServiceFlag {
+			return fmt.Errorf("the Surge user service is already running; use 'surge connect' or stop the service first")
 		}
 
 		// Attempt to acquire lock before any global state initialization
-		isMaster, err := AcquireLock()
+		lock, isMaster, err := TryAcquireInstanceLock(resolveRuntimeDir())
 		if err != nil {
 			return fmt.Errorf("error acquiring lock: %w", err)
 		}
@@ -48,12 +52,12 @@ var serverStartCmd = &cobra.Command{
 			return fmt.Errorf("surge server is already running")
 		}
 		defer func() {
-			if err := ReleaseLock(); err != nil {
+			if err := lock.Release(); err != nil {
 				utils.Debug("Error releasing lock: %v", err)
 			}
 		}()
 
-		if err := initializeGlobalState(); err != nil {
+		if err := initializeLocalEngine(); err != nil {
 			return err
 		}
 
@@ -83,28 +87,56 @@ var serverStartCmd = &cobra.Command{
 var serverStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the running Surge server",
-	Run: func(cmd *cobra.Command, args []string) {
-		pid := readPID()
-		if pid == 0 {
-			fmt.Println("No running Surge server found (PID file missing).")
-			return
-		}
-
-		process, err := os.FindProcess(pid)
+	RunE: func(cmd *cobra.Command, args []string) error {
+		baseURL, token, err := resolveAPIConnection(true)
 		if err != nil {
-			fmt.Printf("Error finding process: %v\n", err)
-			return
+			return err
 		}
-
-		// Try to send SIGTERM
-		err = process.Signal(syscall.SIGTERM)
+		client, err := newRemoteAPIHTTPClient()
 		if err != nil {
-			fmt.Printf("Error stopping server: %v\n", err)
-			return
+			return err
 		}
-
-		fmt.Printf("Sent stop signal to process %d\n", pid)
+		return requestServerShutdown(cmd, client, baseURL, token)
 	},
+}
+
+func requestServerShutdown(cmd *cobra.Command, client *http.Client, baseURL, token string) error {
+	if err := verifySurgeServer(client, baseURL); err != nil {
+		return err
+	}
+	resp, err := doAPIRequestWithClient(client, http.MethodPost, baseURL, token, "/shutdown", nil)
+	if err != nil {
+		return fmt.Errorf("request server shutdown: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("server rejected shutdown: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), "Server shutdown requested.")
+	return err
+}
+
+func verifySurgeServer(client *http.Client, baseURL string) error {
+	resp, err := doAPIRequestWithClient(client, http.MethodGet, baseURL, "", "/health", nil)
+	if err != nil {
+		return fmt.Errorf("verify Surge server: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("verify Surge server: health endpoint returned %s", resp.Status)
+	}
+	var health struct {
+		Status string `json:"status"`
+		Mode   string `json:"mode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024)).Decode(&health); err != nil {
+		return fmt.Errorf("verify Surge server: decode health response: %w", err)
+	}
+	if health.Status != "ok" || (health.Mode != "local" && health.Mode != "service") {
+		return fmt.Errorf("verify Surge server: unexpected health response")
+	}
+	return nil
 }
 
 var serverStatusCmd = &cobra.Command{
@@ -145,14 +177,14 @@ func init() {
 
 	serverCmd.PersistentFlags().StringP("batch", "b", "", "File containing URLs to download")
 	serverCmd.PersistentFlags().IntP("port", "p", 0, "Port to listen on")
-	serverCmd.PersistentFlags().String("bind", serverBindHost, "Address to listen on")
+	serverCmd.PersistentFlags().String("bind", "", "Address to listen on (overrides network.bind_host)")
 	serverCmd.PersistentFlags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
 	serverCmd.PersistentFlags().Bool("exit-when-done", false, "Exit when all downloads complete")
 	serverCmd.PersistentFlags().Bool("no-resume", false, "Do not auto-resume paused downloads on startup")
 	serverCmd.PersistentFlags().String("token", "", "Auth token for API clients (or set SURGE_TOKEN)")
 
-	serverStartCmd.Flags().BoolVar(&isSystemServiceFlag, "is-system-service", false, "Internal flag for service manager")
-	_ = serverStartCmd.Flags().MarkHidden("is-system-service")
+	serverStartCmd.Flags().BoolVar(&managedServiceFlag, "managed-service", false, "Internal flag for a user-managed service")
+	_ = serverStartCmd.Flags().MarkHidden("managed-service")
 }
 
 func savePID() {
@@ -185,7 +217,16 @@ func readPID() int {
 }
 
 func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost string, batchFile string, outputDir string, exitWhenDone bool, noResume bool, tokenOverride string) error {
-	port, listener, err := bindServerListenerOnHost(portFlag, bindHost)
+	var (
+		port     int
+		listener net.Listener
+		err      error
+	)
+	if bindHost != "" {
+		port, listener, err = bindServerListenerOnHost(portFlag, bindHost)
+	} else {
+		port, listener, err = bindServerListener(portFlag)
+	}
 	if err != nil {
 		return err
 	}
@@ -206,7 +247,7 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost 
 	})
 
 	fmt.Printf("Surge %s running in server mode.\n", Version)
-	fmt.Printf("Serving on %s\n", net.JoinHostPort(bindHost, fmt.Sprintf("%d", port)))
+	fmt.Printf("Serving on %s\n", net.JoinHostPort(activeBindHost, fmt.Sprintf("%d", port)))
 	fmt.Println("Press Ctrl+C to exit.")
 
 	StartHeadlessConsumer(cmd.Root().Context(), GlobalService)
@@ -223,7 +264,7 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost 
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				if atomic.LoadInt32(&pendingEnqueue) == 0 && atomic.LoadInt32(&activeDownloads) == 0 {
+				if atomic.LoadInt32(&pendingEnqueue) == 0 {
 					if GlobalPool != nil && GlobalPool.ActiveCount() == 0 {
 						select {
 						case exitWhenDoneCh <- struct{}{}:
@@ -246,6 +287,9 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost 
 		case <-cmd.Root().Context().Done():
 			fmt.Printf("\nService stop requested. Shutting down...\n")
 			_ = executeGlobalShutdown("server: service context cancelled")
+		case reason := <-shutDownRequested:
+			fmt.Printf("\n%s Shutting down...\n", reason)
+			_ = executeGlobalShutdown(reason)
 		case <-exitWhenDoneCh:
 			fmt.Println("All downloads finished. Exiting...")
 			_ = executeGlobalShutdown("server: exit when done")
@@ -264,6 +308,9 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost 
 	case <-cmd.Root().Context().Done():
 		fmt.Printf("\nService stop requested. Shutting down...\n")
 		_ = executeGlobalShutdown("server: service context cancelled")
+	case reason := <-shutDownRequested:
+		fmt.Printf("\nShutdown requested. Shutting down...\n")
+		_ = executeGlobalShutdown(reason)
 	}
 	return nil
 }

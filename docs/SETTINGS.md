@@ -2,6 +2,10 @@
 
 This document covers all configuration options available in Surge. For CLI commands and flags, see the [CLI reference](reference/cli.md).
 
+## Settings screen
+
+The TUI groups options into General, Downloads, Appearance, Network, Categories, Extension, and Advanced. Use the numbered tabs or left and right arrows to switch groups. The configuration file keeps its existing sections independently of these display groups. Deprecated `dial_hedge_count` is accepted for compatibility but is hidden from the settings screen.
+
 ## Configuration File
 
 You can **access the settings in TUI** or configure them via the CLI tool `surge config`. 
@@ -35,7 +39,7 @@ category_enabled = true
 Surge implements a self-healing configuration system to ensure the application remains stable even if the `settings.toml` file is manually edited with invalid values.
 
 - **Range Enforcement**: Numeric values (like connection limits and concurrent downloads) are strictly enforced. If a value is set outside its safe operating range in the TOML file, Surge will automatically reset that specific field to its default value on startup while preserving your other valid settings.
-- **Path Verification**: Paths like `default_download_dir` and individual category paths are verified for existence and accessibility. Broken or inaccessible paths are rolled back to the system's default Downloads directory.
+- **Path Verification**: The default download directory is checked when loading settings. Category paths are preserved even when their directories are missing or unavailable. Surge creates category directories when a download needs them and reports creation or access failures for that download.
 - **Syntactic Validation**: Proxy URLs and DNS server lists are validated for correct syntax.
 - **Category Integrity**: If a custom category has an invalid regular expression pattern, it is automatically pruned from the active list to prevent engine crashes.
 - **Corrupt TOML Fallback**: If the `settings.toml` file is completely unparseable, Surge will log a warning and start with all factory default settings for that session.
@@ -111,13 +115,22 @@ Surge follows OS conventions for storing its files. Below is a breakdown of ever
 | `warn_on_duplicate`    | bool   | Show a warning when adding a download that already exists in the list.                             | `true`  |
 | `extension_prompt`     | bool   | Prompt for confirmation in the TUI when adding downloads via the browser extension.                | `false` |
 | `auto_resume`          | bool   | Automatically resume paused downloads when Surge starts.                                           | `false` |
-| `auto_start`           | bool   | Automatically start Surge as a system service on boot. (See [Run Surge as a service](guides/run-as-a-service.md)).      | `false` |
+| `auto_start`           | bool   | Install the current user's Surge service and start it with that user's login session. (See [Run Surge as a service](guides/run-as-a-service.md)). | `false` |
 | `skip_update_check`    | bool   | Disable automatic check for new versions on startup.                                               | `false` |
 | `clipboard_monitor`    | bool   | Watch the system clipboard for URLs and prompt to download them.                                   | `true`  |
+| `log_retention_count`  | int    | Number of recent log files to keep.                                                                | `5`     |
+
+### Appearance Settings
+
+These options are stored in the `[general]` section of the configuration file.
+
+| Key | Type | Description | Default |
+| :-- | :--- | :---------- | :------ |
 | `theme`                | int    | UI Theme (0=Adaptive, 1=Light, 2=Dark).                                                            | `0`     |
 | `theme_path`           | string | Path to a custom `.toml` color scheme or name of theme in the `themes` directory. See [THEMES.md](THEMES.md). | `""`    |
-| `log_retention_count`  | int    | Number of recent log files to keep.                                                                | `5`     |
+| `transparent_background` | bool | Use the terminal background throughout the TUI. Terminal transparency is configured in the terminal. | `false` |
 | `live_speed_graph`     | bool   | Use live speed for graph instead of EMA smoothed speed.                                            | `false` |
+| `show_speed_graph` | bool | Show the speed graph on the dashboard. | `true` |
 
 ### Connection Settings
 
@@ -130,10 +143,11 @@ Surge follows OS conventions for storing its files. Below is a breakdown of ever
 | `max_concurrent_probes`    | int    | Maximum number of simultaneous server probes when many downloads are added at once (1-10). Requires restart. | `3`     |
 | `user_agent`               | string | Custom User-Agent string for HTTP requests. Leave empty for default.                                  | `""`    |
 | `proxy_url`                | string | HTTP/HTTPS proxy URL (e.g., `http://127.0.0.1:8080`). Leave empty to use system settings.             | `""`    |
+| `bind_host`                | string | Address the HTTP API listens on: `0.0.0.0` (all interfaces) or `127.0.0.1` (this machine only). Requires restart. If the settings file cannot be read or the value is invalid, Surge refuses to start instead of listening on all interfaces. | `0.0.0.0` |
 | `sequential_download`      | bool   | Download file pieces in strict order (Streaming Mode). Useful for previewing media but may be slower. | `false` |
 | `min_chunk_size`           | int64  | Minimum size of a download chunk in bytes (e.g., `2097152` for 2MB).                                  | `2MB`   |
 | `worker_buffer_size`       | int    | I/O buffer size per worker in bytes (e.g., `524288` for 512KB).                                       | `512KB` |
-| `dial_hedge_count`         | int    | Extra prewarmed connections (0-16). Set to 0 to disable prewarming. | `4`     |
+| `dial_hedge_count`         | int    | Deprecated and ignored; connection prewarming is no longer performed. | `4`     |
 
 ### Performance Settings
 
@@ -144,10 +158,45 @@ Surge follows OS conventions for storing its files. Below is a breakdown of ever
 | `slow_worker_grace_period` | duration | Time to wait before checking a worker's speed (e.g., `5s`).                  | `5s`    |
 | `stall_timeout`            | duration | Restart workers that haven't received data for this duration (e.g., `3s`).   | `3s`    |
 | `speed_ema_alpha`          | float    | Exponential moving average smoothing factor for speed calculation (0.0-1.0, 0 disables smoothing). | `0.3`   |
-| `adaptive_concurrency_interval` | duration | Halve connections when throttled, add one connection per interval, and split small tail ranges among idle workers on healthy hosts. Set to `0` to disable adaptation. | `0` |
+| `adaptive_concurrency_interval` | duration | Share a learned host connection budget, halve it when throttled, and add one connection per interval of healthy byte progress. Set to `0` to preserve requested worker counts; shared server cooldowns still apply. | `0` |
 
 ### Category Settings
 
 | Key                    | Type   | Description                                                                                              | Default |
 | :--------------------- | :----- | :------------------------------------------------------------------------------------------------------- | :------ |
 | `category_enabled`     | bool   | Enable automatic sorting of downloads into subfolders based on file type categories.                     | `false` |
+
+### Category priority
+
+Category rules are checked from top to bottom; the first matching rule determines the category and download path. In Settings → Categories, select a category and use Shift+Up / Shift+Down or Shift+K / Shift+J to change its priority. Save the order by closing Settings. Custom categories are added at the bottom and can be moved above broader rules.
+
+### Settings shortcuts and confirmations
+
+- `r` resets the selected setting after confirmation. It does not delete category rules.
+- `Shift+R` resets all settings and category rules to defaults after confirmation. Custom keybindings are kept.
+- `d` deletes the selected category rule after confirmation. Existing downloads and files are kept.
+
+These dialogs initially select **Cancel**. Changes remain staged in Settings until you save and close it.
+
+Category rows show their own shortcut help. Left/right tab switching is inactive while the category list is focused; use `1`–`7` to switch settings tabs. In a category editor, Tab/Down and Shift+Tab/Up move between fields. The `Reset`, `ResetAll`, and `DeleteCategory` bindings can be customized in the `settings` section of the keymap.
+
+### Assigning a download category
+
+The dashboard category picker saves an explicit assignment with the download,
+including **Uncategorized**. Assignments survive restarts and are shared with
+clients connected to the daemon.
+
+After selecting a category, choose **Move file** or **Keep location**. Escape
+returns to the picker without changing the assignment. The dialog shows the
+category folder; Uncategorized uses the default download directory.
+
+Completed files move immediately. Queued, downloading, paused, and failed
+downloads keep their working files and resume data where they are; an approved
+move happens after successful completion. Pending moves survive restarts.
+Choosing Keep location cancels an earlier pending move.
+While a file is moving, its status shows **Moving** and changes to that download
+are temporarily disabled. Other downloads remain usable.
+
+Existing destination files are never overwritten. If a deferred move fails, the
+download remains completed at its original location and the activity log reports
+the failure. Select the category again to retry the move.

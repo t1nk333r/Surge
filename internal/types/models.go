@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
+	"time"
 )
 
 // Task represents a byte range to download.
@@ -34,6 +35,12 @@ func (t *Task) GobDecode(data []byte) error {
 // DownloadRecord is the canonical representation of a download's static configuration,
 // persistent state, and runtime options. It replaces DownloadState, DownloadEntry, and DownloadConfig.
 type DownloadRecord struct {
+	Artifact            ArtifactPolicy `json:"artifact,omitzero"`
+	ErrorCode           string         `json:"error_code,omitempty"`
+	CategoryMoveError   string         `json:"category_move_error,omitempty"`
+	PendingCategoryMove string         `json:"pending_category_move,omitempty"`
+	CategoryAssigned    bool           `json:"category_assigned,omitempty"`
+	CategoryOverride    *string        `json:"category_override,omitempty"`
 	// Identity & Core Info
 	ID         string `json:"id"`
 	URLHash    string `json:"url_hash"`
@@ -74,8 +81,9 @@ type DownloadRecord struct {
 	// SourceURL is the page URL a media URL was extracted from. Extracted URLs
 	// are signed and short-lived, so re-resolving SourceURL is the only way to
 	// resume such a download later. FormatID names the chosen format.
-	// Request headers are deliberately NOT persisted: they can carry
-	// credentials, and a fresh media URL needs freshly resolved headers anyway.
+	// The request headers of an extracted download are deliberately NOT
+	// persisted: they can carry credentials, and a fresh media URL needs
+	// freshly resolved headers anyway.
 	SourceURL string `json:"source_url,omitempty"`
 	FormatID  string `json:"format_id,omitempty"`
 
@@ -92,24 +100,31 @@ type DownloadRecord struct {
 	// such a download resumable.
 	ManifestURL string `json:"manifest_url,omitempty"`
 
-	// Runtime / Transient Configuration (Not persisted)
-	IsResume           bool                 `json:"-" gob:"-"`
-	ProgressCh         chan<- DownloadEvent `json:"-" gob:"-"`
-	ProgressState      interface{}          `json:"-" gob:"-"` // typically *progress.DownloadProgress
-	Runtime            *RuntimeConfig       `json:"-" gob:"-"`
-	Headers            map[string]string    `json:"-" gob:"-"`
-	Limiter            ByteLimiter          `json:"-" gob:"-"`
-	IsExplicitCategory bool                 `json:"-" gob:"-"`
-	SupportsRange      bool                 `json:"-" gob:"-"`
+	// Execution & Throttle State (Transient across retries)
+	ThrottleEpisodeStart time.Time `json:"-"`
+
+	// Runtime / Transient Configuration. The store controls persistence with
+	// explicit projections because encoding/gob ignores struct tags. Headers are
+	// retained only in per-download detail state for authenticated resumes.
+	IsResume           bool                 `json:"-"`
+	ProgressCh         chan<- DownloadEvent `json:"-"`
+	ProgressState      interface{}          `json:"-"` // typically *progress.DownloadProgress
+	Runtime            *RuntimeConfig       `json:"-"`
+	Headers            map[string]string    `json:"-"`
+	Limiter            ByteLimiter          `json:"-"`
+	IsExplicitCategory bool                 `json:"-"`
+	SupportsRange      bool                 `json:"-"`
 }
 
 // DownloadPart is one stream of a multi-part download.
 type DownloadPart struct {
-	URL      string            `json:"url"`
-	FormatID string            `json:"format_id,omitempty"`
-	Kind     string            `json:"kind"`
-	Size     int64             `json:"size,omitempty"`
-	Headers  map[string]string `json:"-" gob:"-"`
+	URL      string `json:"url"`
+	FormatID string `json:"format_id,omitempty"`
+	Kind     string `json:"kind"`
+	Size     int64  `json:"size,omitempty"`
+	// Headers is transient. encoding/gob ignores struct tags, so the store
+	// strips it explicitly before anything is written.
+	Headers map[string]string `json:"-"`
 
 	// Complete is set once the stream has been fetched in full. A part's
 	// working file cannot be judged by its size, because the concurrent
@@ -163,23 +178,30 @@ type MasterList struct {
 
 // DownloadStatus is the transient view returned to the TUI and API clients.
 type DownloadStatus struct {
-	ID           string  `json:"id"`
-	URL          string  `json:"url"`
-	Filename     string  `json:"filename"`
-	DestPath     string  `json:"dest_path,omitempty"`
-	TotalSize    int64   `json:"total_size"`
-	Downloaded   int64   `json:"downloaded"`
-	Progress     float64 `json:"progress"`
-	Speed        float64 `json:"speed"`
-	Status       string  `json:"status"`
-	Error        string  `json:"error,omitempty"`
-	ETA          int64   `json:"eta"`
-	Connections  int     `json:"connections"`
-	AddedAt      int64   `json:"added_at"`
-	TimeTaken    int64   `json:"time_taken"`
-	AvgSpeed     float64 `json:"avg_speed"`
-	RateLimit    int64   `json:"rate_limit,omitempty"`
-	RateLimitSet bool    `json:"rate_limit_set,omitempty"`
+	Phase            string         `json:"phase,omitempty"`
+	MaxConnections   int            `json:"max_connections,omitempty"`
+	Artifact         ArtifactPolicy `json:"artifact,omitzero"`
+	ErrorCode        string         `json:"error_code,omitempty"`
+	Moving           bool           `json:"moving,omitempty"`
+	FileMissing      bool           `json:"file_missing,omitempty"`
+	CategoryOverride *string        `json:"category_override,omitempty"`
+	ID               string         `json:"id"`
+	URL              string         `json:"url"`
+	Filename         string         `json:"filename"`
+	DestPath         string         `json:"dest_path,omitempty"`
+	TotalSize        int64          `json:"total_size"`
+	Downloaded       int64          `json:"downloaded"`
+	Progress         float64        `json:"progress"`
+	Speed            float64        `json:"speed"`
+	Status           string         `json:"status"`
+	Error            string         `json:"error,omitempty"`
+	ETA              int64          `json:"eta"`
+	Connections      int            `json:"connections"`
+	AddedAt          int64          `json:"added_at"`
+	TimeTaken        int64          `json:"time_taken"`
+	AvgSpeed         float64        `json:"avg_speed"`
+	RateLimit        int64          `json:"rate_limit,omitempty"`
+	RateLimitSet     bool           `json:"rate_limit_set,omitempty"`
 }
 
 // CancelResult carries enough metadata for callers to emit lifecycle events

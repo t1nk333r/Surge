@@ -81,19 +81,26 @@ func (m ConfirmationModal) renderBody(width int) string {
 }
 
 func renderYesNoButtons(yesLabel, noLabel string, focused int, btnColor color.Color) string {
-	pad := "   "
+	return renderYesNoButtonsWithSpacing(yesLabel, noLabel, focused, btnColor, "   ", "     ")
+}
 
+// RenderCompactYesNoButtons preserves modal button styling with less spacing.
+func RenderCompactYesNoButtons(yesLabel, noLabel string, focused int, btnColor color.Color) string {
+	return renderYesNoButtonsWithSpacing(yesLabel, noLabel, focused, btnColor, " ", " ")
+}
+
+func renderYesNoButtonsWithSpacing(yesLabel, noLabel string, focused int, btnColor color.Color, pad, gap string) string {
 	if btnColor == nil {
 		btnColor = colors.Pink()
 	}
 
-	activeFirst := lipgloss.NewStyle().Foreground(colors.White()).Background(btnColor).Bold(true).Underline(true)
-	activeRest := lipgloss.NewStyle().Foreground(colors.White()).Background(btnColor).Bold(true)
+	activeFirst := lipgloss.NewStyle().Foreground(colors.ContrastForeground(btnColor)).Background(btnColor).Bold(true).Underline(true)
+	activeRest := lipgloss.NewStyle().Foreground(colors.ContrastForeground(btnColor)).Background(btnColor).Bold(true)
 	activePad := lipgloss.NewStyle().Background(btnColor)
 
-	inactiveFirst := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236")).Underline(true)
-	inactiveRest := lipgloss.NewStyle().Foreground(colors.LightGray()).Background(lipgloss.Color("236"))
-	inactivePad := lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	inactiveFirst := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.SelectionBackground()).Underline(true)
+	inactiveRest := lipgloss.NewStyle().Foreground(colors.White()).Background(colors.SelectionBackground())
+	inactivePad := lipgloss.NewStyle().Background(colors.SelectionBackground())
 
 	yesFirst, yesRest := splitFirst(yesLabel)
 	noFirst, noRest := splitFirst(noLabel)
@@ -112,7 +119,14 @@ func renderYesNoButtons(yesLabel, noLabel string, focused int, btnColor color.Co
 	yesBtn := renderBtn(yesPadStyle, yesFirstStyle, yesRestStyle, yesFirst, yesRest)
 	noBtn := renderBtn(noPadStyle, noFirstStyle, noRestStyle, noFirst, noRest)
 
-	return lipgloss.JoinHorizontal(lipgloss.Center, yesBtn, "     ", noBtn)
+	yesMarker, noMarker := "  ", "  "
+	if focused == 1 {
+		noMarker = "> "
+	} else {
+		yesMarker = "> "
+	}
+	markerStyle := lipgloss.NewStyle().Foreground(btnColor).Bold(true)
+	return lipgloss.JoinHorizontal(lipgloss.Center, markerStyle.Render(yesMarker), yesBtn, gap, markerStyle.Render(noMarker), noBtn)
 }
 
 func splitFirst(label string) (string, string) {

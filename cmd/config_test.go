@@ -189,6 +189,37 @@ func TestConfigCmd_SetAndReset(t *testing.T) {
 	}
 }
 
+func TestConfigCmd_InvalidBindHostBlocksOtherWrites(t *testing.T) {
+	setupIsolatedCmdState(t)
+	path := config.GetSettingsPath()
+	invalid := "[network]\nbind_host = '127.0.0.l'\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(invalid), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"config", "general.auto_resume", "true"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected setting another key to fail while bind_host is invalid")
+	}
+	if data, _ := os.ReadFile(path); string(data) != invalid {
+		t.Fatalf("settings file was rewritten:\n%s", data)
+	}
+
+	rootCmd.SetArgs([]string{"config", "network.bind_host", "127.0.0.1"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("fixing bind_host should succeed: %v", err)
+	}
+	if host, err := config.LoadBindHost(); err != nil || host != "127.0.0.1" {
+		t.Fatalf("LoadBindHost() = %q, %v; want 127.0.0.1", host, err)
+	}
+}
+
 func TestConfigCmd_Open(t *testing.T) {
 	setupIsolatedCmdState(t)
 
@@ -208,7 +239,7 @@ func TestConfigCmd_Open(t *testing.T) {
 		}
 	}
 
-	t.Setenv("EDITOR", dummyEditor)
+	t.Setenv("EDITOR", dummyEditor+" --wait")
 
 	buf := new(bytes.Buffer)
 	rootCmd.SetOut(buf)
@@ -217,5 +248,41 @@ func TestConfigCmd_Open(t *testing.T) {
 
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSplitEditorCommand_QuotedExecutableAndArguments(t *testing.T) {
+	parts, err := splitEditorCommand(`"/tmp/editor with spaces" --wait --title="Surge settings"`)
+	if err != nil {
+		t.Fatalf("split editor command: %v", err)
+	}
+	want := []string{"/tmp/editor with spaces", "--wait", "--title=Surge settings"}
+	if len(parts) != len(want) {
+		t.Fatalf("parts = %#v, want %#v", parts, want)
+	}
+	for i := range want {
+		if parts[i] != want[i] {
+			t.Fatalf("parts = %#v, want %#v", parts, want)
+		}
+	}
+}
+
+func TestConfigOpenUnquotedEditorPathWithSpaces(t *testing.T) {
+	setupIsolatedCmdState(t)
+	var editor string
+	if runtime.GOOS == "windows" {
+		editor = filepath.Join(t.TempDir(), "editor with spaces.bat")
+		if err := os.WriteFile(editor, []byte("@echo off\r\nexit 0\r\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		editor = filepath.Join(t.TempDir(), "editor with spaces")
+		if err := os.WriteFile(editor, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("EDITOR", editor)
+	if err := openSettingsFile(); err != nil {
+		t.Fatalf("open settings with unquoted editor path: %v", err)
 	}
 }

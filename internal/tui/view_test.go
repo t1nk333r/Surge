@@ -17,6 +17,28 @@ import (
 
 var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+func TestDownloadDirectoryUsesDestinationPathFormat(t *testing.T) {
+	for _, tt := range []struct{ destination, want string }{
+		{`C:\Users\Alice\Downloads\file.zip`, `C:\Users\Alice\Downloads`},
+		{`C:\file.zip`, `C:\`},
+		{`C:/file.zip`, `C:/`},
+		{`C:/Users/Alice/file.zip`, `C:/Users/Alice`},
+		{`C:\Users/Alice\file.zip`, `C:\Users/Alice`},
+		{`\\server\share\file.zip`, `\\server\share`},
+		{`//server/share/file.zip`, `//server/share`},
+		{"/home/alice/Downloads/file.zip", "/home/alice/Downloads"},
+		{"/file.zip", "/"},
+		{`/home/alice/a\b/file.zip`, `/home/alice/a\b`},
+		{"file.zip", "."},
+	} {
+		t.Run(tt.destination, func(t *testing.T) {
+			if got := downloadDirectory(tt.destination); got != tt.want {
+				t.Fatalf("directory = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFormatDurationForUI(t *testing.T) {
 	tests := []struct {
 		name string
@@ -34,7 +56,8 @@ func TestFormatDurationForUI(t *testing.T) {
 		{"23h59m59s", 23*time.Hour + 59*time.Minute + 59*time.Second, "23:59:59"},
 		{"1 day", 24 * time.Hour, "1d"},
 		{"1d 5h", 29 * time.Hour, "1d 5h"},
-		{"30+ days", 31 * 24 * time.Hour, "\u221E"},
+		{"30 days", 30 * 24 * time.Hour, "30d"},
+		{"30+ days", 31 * 24 * time.Hour, "31d"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -103,6 +126,7 @@ func TestGetDownloadStatus(t *testing.T) {
 			name: "Resuming State",
 			model: &DownloadModel{
 				resuming: true,
+				started:  true,
 			},
 			expected: "⠋ Resuming...",
 		},
@@ -220,6 +244,28 @@ func TestView_QuitConfirmTinyTerminalDoesNotPanic(t *testing.T) {
 	m.width = 10
 	m.height = 5
 	_ = m.View()
+}
+
+func TestView_CompactQuitConfirmPreservesCopyAndFocus(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{40, 5}, {20, 5}, {20, 1}} {
+		m := InitialRootModel(1701, "test-version", nil, orchestrator.NewLifecycleManager(nil, nil, nil), nil, false)
+		m.state = QuitConfirmState
+		m.width, m.height = size.width, size.height
+		yesFocused := m.View().Content
+		plain := ansiEscapeRE.ReplaceAllString(yesFocused, "")
+		for _, label := range []string{"Yep!", "Nope"} {
+			if !strings.Contains(plain, label) {
+				t.Fatalf("expected %q at %dx%d, got %q", label, m.width, m.height, plain)
+			}
+		}
+		if m.width == 40 && !strings.Contains(plain, "Are you sure you want to quit?") {
+			t.Fatalf("expected full confirmation message, got %q", plain)
+		}
+		m.quitConfirmFocused = 1
+		if yesFocused == m.View().Content {
+			t.Fatalf("selection must change visibly at %dx%d", m.width, m.height)
+		}
+	}
 }
 
 func TestView_RemoveConfirmTruncatesUTF8FilenameSafely(t *testing.T) {
@@ -805,5 +851,42 @@ func TestUpdateETA_ResetOnResume(t *testing.T) {
 	d.UpdateETA()
 	if d.etaSpeed != 5*1024*1024 {
 		t.Fatalf("expected ETA speed to re-seed entirely at new speed, got %v", d.etaSpeed)
+	}
+}
+
+func TestFileDetailsFieldOrder(t *testing.T) {
+	d := NewDownloadModel("id", "https://example.com/file", "file", 100)
+	d.Destination = "/tmp/file"
+	text := ansiEscapeRE.ReplaceAllString(renderFocusedDetails(d, 100, ""), "")
+	previous := -1
+	for _, label := range []string{"File:", "Path:", "ID:", "URL:"} {
+		index := strings.Index(text, label)
+		if index <= previous {
+			t.Fatalf("field %q out of order in details: %s", label, text)
+		}
+		previous = index
+	}
+}
+
+func TestFileDetailsTwoLinesAndNoKeyboardHints(t *testing.T) {
+	d := NewDownloadModel(strings.Repeat("i", 80), "https://example.com/"+strings.Repeat("u", 80), strings.Repeat("f", 80), 100)
+	d.Destination = "/tmp/" + strings.Repeat("p", 80) + "/file"
+	text := ansiEscapeRE.ReplaceAllString(renderFocusedDetails(d, 50, ""), "")
+	lines := strings.Split(text, "\n")
+	positions := make([]int, 0, 4)
+	for i, line := range lines {
+		for _, label := range []string{"File:", "Path:", "ID:", "URL:"} {
+			if strings.Contains(line, label) {
+				positions = append(positions, i)
+			}
+		}
+	}
+	if len(positions) != 4 || positions[1]-positions[0] != 2 || positions[2]-positions[1] != 2 || positions[3]-positions[2] != 2 {
+		t.Fatalf("expected two lines per field: %s", text)
+	}
+	for _, hint := range []string{"[o]", "[shift+o]", "[ctrl+y]", "[ctrl+i]"} {
+		if strings.Contains(text, hint) {
+			t.Fatalf("unexpected keyboard hint %q: %s", hint, text)
+		}
 	}
 }

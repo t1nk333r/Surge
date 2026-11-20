@@ -1,6 +1,8 @@
 package probe_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"net/http"
@@ -147,6 +149,41 @@ func TestProbeServer_RangeSupported(t *testing.T) {
 	}
 }
 
+// A server may compress a response when the request has no Accept-Encoding,
+// and Content-Range then describes the compressed bytes. Downloads ask for
+// identity, so the probe must too or the size will not match what arrives.
+func TestProbeServer_SizeIsForIdentityEncoding(t *testing.T) {
+	body := bytes.Repeat([]byte("surge "), 4096)
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write(body)
+	_ = zw.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		content := body
+		if r.Header.Get("Accept-Encoding") != "identity" {
+			w.Header().Set("Content-Encoding", "gzip")
+			content = gz.Bytes()
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(content[:1])
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := probe.ProbeServer(ctx, server.URL, "", nil)
+	if err != nil {
+		t.Fatalf("probeServer failed: %v", err)
+	}
+	if result.FileSize != int64(len(body)) {
+		t.Errorf("FileSize = %d, want the identity size %d (gzip size is %d)", result.FileSize, len(body), gz.Len())
+	}
+}
+
 func TestProbeServer_RangeNotSupported(t *testing.T) {
 	server := testutil.NewMockServerT(t,
 		testutil.WithFileSize(2048),
@@ -215,7 +252,8 @@ func TestProbeServer_InvalidURL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := probe.ProbeServer(ctx, "http://invalid-host-that-does-not-exist.test:9999/file", "", nil)
+	// Keep this a malformed URL so the test does not start a real DNS lookup.
+	_, err := probe.ProbeServer(ctx, "http://%zz/file", "", nil)
 	if err == nil {
 		t.Error("Expected error for invalid URL")
 	}

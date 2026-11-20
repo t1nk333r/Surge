@@ -2,15 +2,37 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/SurgeDM/Surge/internal/utils"
 )
+
+func TestSettingsLabelsUseSentenceCase(t *testing.T) {
+	words := regexp.MustCompile(`[A-Za-z]+`)
+	allowed := map[string]bool{"URL": true, "DNS": true, "EMA": true, "Chrome": true, "Firefox": true}
+	for category, settings := range GetSettingsMetadata() {
+		for _, setting := range settings {
+			parts := words.FindAllString(setting.Label, -1)
+			if len(parts) == 0 || !unicode.IsUpper(rune(parts[0][0])) {
+				t.Errorf("%s/%s: label %q should start with a capital letter", category, setting.Key, setting.Label)
+				continue
+			}
+			for _, word := range parts[1:] {
+				if unicode.IsUpper(rune(word[0])) && !allowed[word] {
+					t.Errorf("%s/%s: label %q has unexpected capitalized word %q", category, setting.Key, setting.Label, word)
+				}
+			}
+		}
+	}
+}
 
 func TestDefaultSettings(t *testing.T) {
 	settings := DefaultSettings()
@@ -111,6 +133,46 @@ func TestDefaultSettings(t *testing.T) {
 	})
 }
 
+func TestNormalizeValuesRejectsFractionalTypeInt(t *testing.T) {
+	settings := DefaultSettings()
+	settings.Network.MaxConnectionsPerDownload.Value = 3.5
+
+	if err := settings.NormalizeValues(); err == nil {
+		t.Fatal("expected fractional TypeInt value to be rejected")
+	}
+
+	settings.Network.MaxConnectionsPerDownload.Value = 3.0
+	if err := settings.NormalizeValues(); err != nil {
+		t.Fatalf("integral float TypeInt value was rejected: %v", err)
+	}
+	if got := settings.Network.MaxConnectionsPerDownload.Value; got != 3 {
+		t.Fatalf("normalized TypeInt value = %#v, want 3", got)
+	}
+}
+
+func TestValidateStrictDefersCategoryFilesystemChecks(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(filePath, []byte("file"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "missing", path: filepath.Join(t.TempDir(), "missing")},
+		{name: "file", path: filePath},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings := DefaultSettings()
+			settings.Categories.Categories = []Category{{Name: "Test", Pattern: ".*", Path: test.path}}
+			if err := settings.ValidateStrict(true); err != nil {
+				t.Fatalf("filesystem checks should happen when downloading: %v", err)
+			}
+		})
+	}
+}
+
 func TestDefaultSettings_Consistency(t *testing.T) {
 	s1 := DefaultSettings()
 	s2 := DefaultSettings()
@@ -194,30 +256,33 @@ func TestEveryValidatorIsInCategoriesList(t *testing.T) {
 	}
 }
 
-func TestCategoriesListMatchesCategoryOrder(t *testing.T) {
+func TestDisplayCategoriesCoverSettings(t *testing.T) {
 	settings := DefaultSettings()
-	order := CategoryOrder()
-
-	// 1. Verify every category in CategoriesList is present in CategoryOrder
-	orderMap := make(map[string]bool)
-	for _, name := range order {
-		orderMap[name] = true
-	}
-	for _, cat := range settings.CategoriesList {
-		if !orderMap[cat.Name] {
-			t.Errorf("Category %q is in CategoriesList but missing from CategoryOrder()", cat.Name)
+	seen := map[string]bool{}
+	for _, category := range CategoryOrder() {
+		entries := GetSettingsMetadata()[category]
+		if len(entries) == 0 {
+			t.Errorf("display category %s is empty", category)
+		}
+		for _, entry := range entries {
+			if seen[entry.Key] {
+				t.Errorf("setting %s appears more than once", entry.Key)
+			}
+			seen[entry.Key] = true
+			if settings.FindSetting(category, entry.Key) == nil {
+				t.Errorf("cannot find %s in %s", entry.Key, category)
+			}
 		}
 	}
-
-	// 2. Verify every category in CategoryOrder is present in CategoriesList
-	listMap := make(map[string]bool)
-	for _, cat := range settings.CategoriesList {
-		listMap[cat.Name] = true
-	}
-	for _, name := range order {
-		if !listMap[name] {
-			t.Errorf("Category %q is in CategoryOrder() but missing from CategoriesList", name)
+	for _, category := range settings.CategoriesList {
+		for _, setting := range category.Settings {
+			if setting.Key != "dial_hedge_count" && !seen[setting.Key] {
+				t.Errorf("setting %s is missing from display", setting.Key)
+			}
 		}
+	}
+	if seen["dial_hedge_count"] {
+		t.Error("deprecated dial hedge count is visible")
 	}
 }
 
@@ -302,6 +367,56 @@ func TestLoadSettings_MissingFile(t *testing.T) {
 		if Resolve[int](settings.Network.MaxConnectionsPerDownload) <= 0 {
 			t.Error("Should return default settings with valid values")
 		}
+	}
+}
+
+func TestLoadBindHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string // empty means no settings file
+		want    string
+		wantErr bool
+	}{
+		{name: "no settings file", want: DefaultBindHost},
+		{name: "key not set", content: "[network]\nproxy_url = ''\n", want: DefaultBindHost},
+		{name: "loopback", content: "[network]\nbind_host = '127.0.0.1'\n", want: "127.0.0.1"},
+		{name: "section name case", content: "[Network]\nbind_host = '127.0.0.1'\n", want: "127.0.0.1"},
+		{name: "key name case ignored like LoadSettings", content: "[network]\nBIND_HOST = '127.0.0.1'\n", want: DefaultBindHost},
+		{name: "set in two sections", content: "[network]\nbind_host = '127.0.0.1'\n[Network]\nbind_host = '0.0.0.0'\n", wantErr: true},
+		{name: "invalid value", content: "[network]\nbind_host = '192.168.1.10'\n", wantErr: true},
+		{name: "not a string", content: "[network]\nbind_host = 1\n", wantErr: true},
+		{name: "corrupt file", content: "[network\nbind_host = '127.0.0.1'\n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", tmpDir)
+			t.Setenv("APPDATA", tmpDir)
+			if tt.content != "" {
+				path := GetSettingsPath()
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := LoadBindHost()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("LoadBindHost() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -392,6 +507,8 @@ func TestSaveSettings_RealFunction(t *testing.T) {
 	original := DefaultSettings()
 	original.Network.MaxConnectionsPerDownload.Value = 48
 	original.General.AutoResume.Value = true
+	original.General.Theme.Value = ThemeDark
+	original.General.TransparentBackground.Value = true
 
 	err := SaveSettings(original)
 	if err != nil {
@@ -408,6 +525,12 @@ func TestSaveSettings_RealFunction(t *testing.T) {
 	}
 	if !Resolve[bool](loaded.General.AutoResume) {
 		t.Error("AutoResume should be true")
+	}
+	if Resolve[int](loaded.General.Theme) != ThemeDark || !Resolve[bool](loaded.General.TransparentBackground) {
+		t.Error("appearance settings did not survive save and load")
+	}
+	if loaded.FindSetting("Appearance", "theme") != loaded.FindSetting("General", "theme") {
+		t.Error("legacy general lookup must address the appearance setting")
 	}
 }
 
@@ -457,6 +580,28 @@ func TestSettings_Validate(t *testing.T) {
 			validate: func(t *testing.T, s *Settings) {
 				if Resolve[int](s.Network.MaxConnectionsPerDownload) != Resolve[int](defaults.Network.MaxConnectionsPerDownload) {
 					t.Errorf("Expected default %d, got %d", Resolve[int](defaults.Network.MaxConnectionsPerDownload), Resolve[int](s.Network.MaxConnectionsPerDownload))
+				}
+			},
+		},
+		{
+			name: "Loopback Bind Host Kept",
+			modify: func(s *Settings) {
+				s.Network.BindHost.Value = "127.0.0.1"
+			},
+			validate: func(t *testing.T, s *Settings) {
+				if got := s.Network.BindHost.Value; got != "127.0.0.1" {
+					t.Errorf("Expected 127.0.0.1, got %v", got)
+				}
+			},
+		},
+		{
+			name: "Unreachable Bind Host Reset",
+			modify: func(s *Settings) {
+				s.Network.BindHost.Value = "192.168.1.10"
+			},
+			validate: func(t *testing.T, s *Settings) {
+				if got := s.Network.BindHost.Value; got != defaults.Network.BindHost.Value {
+					t.Errorf("Expected default %v, got %v", defaults.Network.BindHost.Value, got)
 				}
 			},
 		},
@@ -657,5 +802,27 @@ func TestCategorySettings_UnmarshalJSON_BackwardCompatibility(t *testing.T) {
 	// CategoryEnabled should remain default (false)
 	if Resolve[bool](s2.Categories.CategoryEnabled) {
 		t.Errorf("Expected category_enabled to remain false")
+	}
+}
+
+func TestClonePreservesEmptyCategories(t *testing.T) {
+	for _, categories := range [][]Category{nil, {}} {
+		settings := DefaultSettings()
+		settings.Categories.Categories = categories
+		if got := settings.Clone().Categories.Categories; !reflect.DeepEqual(got, categories) {
+			t.Fatalf("Clone categories = %#v, want %#v", got, categories)
+		}
+	}
+}
+
+func TestNormalizeValuesRejectsInvalidIntegers(t *testing.T) {
+	for _, setting := range []string{"max_connections_per_host", "min_chunk_size"} {
+		for _, value := range []float64{1048576.5, math.NaN(), math.Inf(1), math.Ldexp(1, 63)} {
+			settings := DefaultSettings()
+			settings.FindSetting("Network", setting).Value = value
+			if err := settings.NormalizeValues(); err == nil {
+				t.Fatalf("%s accepted %v", setting, value)
+			}
+		}
 	}
 }

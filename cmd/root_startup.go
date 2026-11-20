@@ -3,12 +3,66 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
-	"sync/atomic"
 
 	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/scheduler"
+	"github.com/SurgeDM/Surge/internal/service"
 	"github.com/SurgeDM/Surge/internal/store"
+	"github.com/SurgeDM/Surge/internal/types"
 	"github.com/SurgeDM/Surge/internal/utils"
 )
+
+// initializeLocalEngine is called only by local TUI/server owners, after the
+// instance lock is acquired. Client and metadata commands never create a pool.
+func initializeLocalEngine() error {
+	if GlobalService != nil {
+		if err := GlobalService.Shutdown(); err != nil {
+			return fmt.Errorf("stop previous local service: %w", err)
+		}
+	}
+	if lifecycle := currentLifecycle(); lifecycle != nil {
+		lifecycle.Shutdown()
+	}
+	if GlobalPool != nil {
+		GlobalPool.GracefulShutdown()
+	}
+	if cleanup := takeLifecycleCleanup(); cleanup != nil {
+		cleanup()
+	}
+	globalLifecycleMu.Lock()
+	GlobalService = nil
+	GlobalLifecycle = nil
+	globalLifecycleMu.Unlock()
+	GlobalPool = nil
+	GlobalProgressCh = nil
+	globalHTTPServerMu.Lock()
+	server := globalHTTPServer
+	globalHTTPServer = nil
+	globalHTTPServerMu.Unlock()
+	if server != nil {
+		_ = server.Close()
+	}
+
+	setGlobalSettings(nil)
+	settings := getSettings()
+	setGlobalSettings(settings)
+	if err := initializeGlobalState(); err != nil {
+		return err
+	}
+	GlobalProgressCh = make(chan types.DownloadEvent, types.ProgressChannelBuffer)
+	GlobalPool = scheduler.New(GlobalProgressCh, config.Resolve[int](settings.Network.MaxConcurrentDownloads))
+	return nil
+}
+
+// initializeClientState prepares local history/auth only when needed.
+// Explicit remote clients use the configured endpoint without touching local
+// settings, state directories, history, or a local download engine.
+func initializeClientState() error {
+	if resolveHostTarget() != "" {
+		return nil
+	}
+	return initializeLocalState()
+}
 
 func runStartupIntegrityCheck() string {
 	// Normalize downloads stuck in "downloading" status from a prior crash/kill.
@@ -38,7 +92,7 @@ func runStartupIntegrityCheck() string {
 // initializeGlobalState sets up the environment for a process that hosts the
 // engine (the TUI and `surge server`): the store, and a debug log of its own.
 func initializeGlobalState() error {
-	if err := initializeClientState(); err != nil {
+	if err := initializeLocalState(); err != nil {
 		return err
 	}
 
@@ -55,12 +109,12 @@ func initializeGlobalState() error {
 	return nil
 }
 
-// initializeClientState is the subset a thin client command needs: the
+// initializeLocalState is the subset a thin client command needs: the
 // directories, the store and the settings. It deliberately does not open a
 // debug log. A client such as `surge ls` runs once per poll from the desktop
 // widget, and a log file per invocation would rotate the server's own log
 // out of the retention window within seconds.
-func initializeClientState() error {
+func initializeLocalState() error {
 	if err := config.EnsureDirs(); err != nil {
 		return fmt.Errorf("failed to create surge directories: %w", err)
 	}
@@ -69,8 +123,13 @@ func initializeClientState() error {
 }
 
 func getSettings() *config.Settings {
-	if globalSettings != nil {
-		return globalSettings
+	if owner, ok := GlobalService.(service.SettingsService); ok {
+		if settings, err := owner.GetSettings(); err == nil {
+			return settings
+		}
+	}
+	if settings := getGlobalSettings(); settings != nil {
+		return settings
 	}
 	settings, err := config.LoadSettings()
 	if err != nil {
@@ -81,6 +140,18 @@ func getSettings() *config.Settings {
 		return defaults
 	}
 	return settings
+}
+
+func getGlobalSettings() *config.Settings {
+	globalSettingsMu.RLock()
+	defer globalSettingsMu.RUnlock()
+	return globalSettings.Clone()
+}
+
+func setGlobalSettings(settings *config.Settings) {
+	globalSettingsMu.Lock()
+	globalSettings = settings.Clone()
+	globalSettingsMu.Unlock()
 }
 
 func resumePausedDownloads() {
@@ -100,8 +171,8 @@ func resumePausedDownloads() {
 		if GlobalService == nil || entry.ID == "" {
 			continue
 		}
-		if err := GlobalService.Resume(entry.ID); err == nil {
-			atomic.AddInt32(&activeDownloads, 1)
+		if err := GlobalService.Resume(entry.ID); err != nil {
+			utils.Debug("Failed to resume download %s at startup: %v", entry.ID, err)
 		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SurgeDM/Surge/internal/config"
 	"github.com/SurgeDM/Surge/internal/service"
@@ -18,32 +19,18 @@ import (
 	"github.com/google/uuid"
 )
 
-// resolveTokenPath returns the path of the auth-token file that this
-// process should use.  When the process is running as root/SYSTEM the
-// token lives in the system state directory so that the daemon and the
-// interactive user look in the same place.
 func resolveTokenPath() string {
-	if isElevated() {
-		return filepath.Join(config.GetSystemStateDir(), "token")
-	}
 	return filepath.Join(config.GetStateDir(), "token")
 }
 
-// resolveRuntimeDir returns the runtime directory this process should use for
-// port/PID files.  Mirrors resolveTokenPath: elevated processes (system service
-// daemons) write to GetSystemRuntimeDir() so that non-elevated clients running
-// getActiveConnectionDetails() can discover them via the system candidate.
 func resolveRuntimeDir() string {
-	if isElevated() {
-		return config.GetSystemRuntimeDir()
-	}
 	return config.GetRuntimeDir()
 }
 
-const serverBindHost = "0.0.0.0"
+const maxAPIRequestBodyBytes = 8 << 20
 
-// findAvailablePortOnHost tries ports starting from start on bindHost.
-func findAvailablePortOnHost(bindHost string, start int) (int, net.Listener) {
+// findAvailablePort tries ports starting from 'start' until one is available
+func findAvailablePort(bindHost string, start int) (int, net.Listener) {
 	for port := start; port < start+100; port++ {
 		ln, err := net.Listen("tcp", net.JoinHostPort(bindHost, fmt.Sprintf("%d", port)))
 		if err == nil {
@@ -53,12 +40,18 @@ func findAvailablePortOnHost(bindHost string, start int) (int, net.Listener) {
 	return 0, nil
 }
 
-// findAvailablePort preserves the default all-interface listener used by the
-// interactive server and existing callers.
-func findAvailablePort(start int) (int, net.Listener) {
-	return findAvailablePortOnHost(serverBindHost, start)
+// bindServerListener refuses to start when network.bind_host cannot be read,
+// rather than falling back to all interfaces.
+func bindServerListener(portFlag int) (int, net.Listener, error) {
+	bindHost, err := config.LoadBindHost()
+	if err != nil {
+		return 0, nil, fmt.Errorf("cannot determine the HTTP API bind address: %w", err)
+	}
+	return bindServerListenerOnHost(portFlag, bindHost)
 }
 
+// bindServerListenerOnHost binds an explicit host, such as `surge server
+// --bind`, which takes precedence over network.bind_host.
 func bindServerListenerOnHost(portFlag int, bindHost string) (int, net.Listener, error) {
 	bindHost = strings.TrimSpace(bindHost)
 	if bindHost == "" {
@@ -71,17 +64,15 @@ func bindServerListenerOnHost(portFlag int, bindHost string) (int, net.Listener,
 		if err != nil {
 			return 0, nil, fmt.Errorf("could not bind to %s: %w", address, err)
 		}
+		activeBindHost = bindHost
 		return portFlag, ln, nil
 	}
-	port, ln := findAvailablePortOnHost(bindHost, 1700)
+	port, ln := findAvailablePort(bindHost, 1700)
 	if ln == nil {
 		return 0, nil, fmt.Errorf("could not find an available port on %s", bindHost)
 	}
+	activeBindHost = bindHost
 	return port, ln, nil
-}
-
-func bindServerListener(portFlag int) (int, net.Listener, error) {
-	return bindServerListenerOnHost(portFlag, serverBindHost)
 }
 
 // saveActivePort writes the active port for local CLI and extension discovery.
@@ -111,6 +102,8 @@ var (
 	globalHTTPServer   *http.Server
 	globalHTTPServerMu sync.Mutex
 	activeServerMode   = "local"
+	// activeBindHost is the address the HTTP API listener was bound to.
+	activeBindHost = config.DefaultBindHost
 )
 
 // startHTTPServer starts the HTTP server using an existing listener
@@ -126,9 +119,14 @@ func startHTTPServer(ln net.Listener, port int, defaultOutputDir string, service
 	registerHTTPRoutes(mux, port, defaultOutputDir, service)
 
 	// Wrap mux with Auth and CORS (CORS outermost to ensure 401/403 include headers)
-	handler := corsMiddleware(authMiddleware(authToken, mux))
+	handler := corsMiddleware(authMiddleware(authToken, limitAPIRequestBody(mux)))
 
-	server := &http.Server{Handler: handler}
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	globalHTTPServerMu.Lock()
 	globalHTTPServer = server
 	globalHTTPServerMu.Unlock()
@@ -169,6 +167,13 @@ func isAllowedCORSOrigin(origin string) bool {
 		return true
 	}
 	return false
+}
+
+func limitAPIRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestBodyBytes)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -260,7 +265,6 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 func ensureAuthToken() string {
 	tokenFile := resolveTokenPath()
 	if token, err := readTokenFromFile(tokenFile); err == nil {
-		mirrorTokenToRuntime(token)
 		return token
 	}
 
@@ -268,7 +272,6 @@ func ensureAuthToken() string {
 	if err := writeTokenToFile(tokenFile, token); err != nil {
 		utils.Debug("Failed to write token file in %s: %v", tokenFile, err)
 	}
-	mirrorTokenToRuntime(token)
 	return token
 }
 
@@ -277,32 +280,6 @@ func persistAuthToken(token string) {
 	if err := writeTokenToFile(tokenFile, token); err != nil {
 		utils.Debug("Failed to write token file in %s: %v", tokenFile, err)
 	}
-	mirrorTokenToRuntime(token)
-}
-
-// ensureSystemToken reads (or generates) the token used by the system service
-// and returns it.  This is always in GetSystemStateDir regardless of the
-// current user — callers that need the system token use this directly.
-func ensureSystemToken() (string, error) {
-	tokenFile := filepath.Join(config.GetSystemStateDir(), "token")
-	if token, err := readTokenFromFile(tokenFile); err == nil {
-		mirrorTokenToRuntime(token)
-		return token, nil
-	}
-	token := uuid.New().String()
-	if err := writeTokenToFile(tokenFile, token); err != nil {
-		return "", fmt.Errorf("failed to write system token to %s: %w", tokenFile, err)
-	}
-	mirrorTokenToRuntime(token)
-	return token, nil
-}
-
-// readSystemServiceToken reads the token from the system state directory
-// without generating one.  Returns an error if the file doesn't exist or
-// isn't readable (the caller may need elevated privileges).
-func readSystemServiceToken() (string, error) {
-	tokenFile := filepath.Join(config.GetSystemStateDir(), "token")
-	return readTokenFromFile(tokenFile)
 }
 
 func readTokenFromFile(path string) (string, error) {
@@ -321,25 +298,8 @@ func writeTokenToFile(path string, token string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(token), 0o600)
-}
-
-// mirrorTokenToRuntime writes an owner-only copy of the token to the runtime
-// dir so that local CLI clients can auto-discover and connect without needing
-// sudo. Same-uid readers are unaffected by 0600; the mode matters because
-// GetRuntimeDir falls back to $XDG_STATE_HOME/surge/runtime when
-// XDG_RUNTIME_DIR is unset, i.e. outside the 0700 /run/user/<uid> tree.
-func mirrorTokenToRuntime(token string) {
-	runtimeDir := resolveRuntimeDir()
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-		return
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		return err
 	}
-	// MkdirAll and WriteFile leave an existing dir/file mode alone, and older
-	// Surge versions created both world-readable.
-	_ = os.Chmod(runtimeDir, 0o700)
-	runtimeTokenFile := filepath.Join(runtimeDir, "token")
-	if err := os.WriteFile(runtimeTokenFile, []byte(token), 0o600); err != nil {
-		return
-	}
-	_ = os.Chmod(runtimeTokenFile, 0o600)
+	return os.Chmod(path, 0o600)
 }

@@ -10,22 +10,44 @@ import (
 )
 
 func (m RootModel) handleDownloadRequestMsg(msg types.DownloadEvent, queueIfBusy bool) (tea.Model, tea.Cmd) {
+	msg.DownloadID = strings.TrimSpace(msg.DownloadID)
+	if msg.DownloadID != "" {
+		duplicateID := m.FindDownloadByID(msg.DownloadID) != nil ||
+			(m.isRequestConfirmationBusy() && m.pendingDownloadID == msg.DownloadID)
+		for _, queued := range m.pendingRequestQueue {
+			duplicateID = duplicateID || strings.TrimSpace(queued.DownloadID) == msg.DownloadID
+		}
+		if duplicateID {
+			m.addStyledLogEntry(logError, "\u2716 Download ID already exists")
+			if !queueIfBusy {
+				return m.showNextPendingRequest()
+			}
+			return m, nil
+		}
+	}
+
 	if queueIfBusy && m.isRequestConfirmationBusy() {
 		m.pendingRequestQueue = append(m.pendingRequestQueue, msg)
 		return m, nil
 	}
 
+	m.pendingDownloadID = msg.DownloadID
 	path := strings.TrimSpace(msg.Path)
 	isDefaultPath := m.isDefaultDownloadPath(path)
 	if path == "" {
 		isDefaultPath = true
 		path = m.defaultDownloadPath()
 	}
+	if msg.IsExplicitCategory {
+		isDefaultPath = false
+	}
 
 	duplicate := m.checkForDuplicate(msg.URL)
+	m.pendingSkipDuplicateWarning = msg.SkipDuplicateWarning
 
-	if duplicate != nil && config.Resolve[bool](m.Settings.General.WarnOnDuplicate) {
-		utils.Debug("Duplicate download detected in TUI: %s", msg.URL)
+	if duplicate != nil && config.Resolve[bool](m.Settings.General.WarnOnDuplicate) && !msg.SkipDuplicateWarning {
+		utils.Debug("Duplicate download detected in TUI for host %s", utils.URLHostForLog(msg.URL))
+		m.pendingDownloadID = msg.DownloadID
 		m.pendingURL = msg.URL
 		m.pendingMirrors = msg.Mirrors
 		m.pendingHeaders = msg.Headers
@@ -40,6 +62,7 @@ func (m RootModel) handleDownloadRequestMsg(msg types.DownloadEvent, queueIfBusy
 	}
 
 	if m.Settings != nil && config.Resolve[bool](m.Settings.Extension.ExtensionPrompt) {
+		m.pendingDownloadID = msg.DownloadID
 		m.pendingURL = msg.URL
 		m.pendingMirrors = msg.Mirrors
 		m.pendingHeaders = msg.Headers
@@ -87,6 +110,7 @@ func (m RootModel) isRequestConfirmationBusy() bool {
 }
 
 func (m RootModel) showNextPendingRequest() (tea.Model, tea.Cmd) {
+	m.pendingDownloadID = ""
 	if len(m.pendingRequestQueue) == 0 {
 		if len(m.pendingBatchRequestQueue) == 0 {
 			return m, nil

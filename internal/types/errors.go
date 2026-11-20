@@ -9,6 +9,7 @@ import (
 
 // Common errors
 var (
+	ErrMoving             = errors.New("file is moving; changes are temporarily disabled")
 	ErrPaused             = errors.New("download paused")
 	ErrNotFound           = errors.New("download not found")
 	ErrCompleted          = errors.New("download already completed")
@@ -31,6 +32,12 @@ var (
 	// ErrInsufficientDiskSpace indicates the destination volume is full or
 	// the user's quota has been exhausted. Retry is pointless.
 	ErrInsufficientDiskSpace = errors.New("insufficient disk space")
+
+	// ErrRangeUnsupported indicates the server returned 200 OK without range content when requested
+	ErrRangeUnsupported = errors.New("server indicated success (200) but ignored range request (expected 206)")
+
+	// ErrRetryBudgetExceeded ends automatic retries while retaining resumable data.
+	ErrRetryBudgetExceeded = errors.New("automatic retry budget exhausted")
 )
 
 // IsInsufficientDiskSpace reports whether err is (or wraps) a disk-full

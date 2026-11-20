@@ -30,6 +30,7 @@ type queuedTask struct {
 	cfg      types.DownloadRecord
 	retries  int
 	inFlight bool
+	retryAt  time.Time
 }
 
 // Scheduler manages the download workers and tasks.
@@ -51,10 +52,25 @@ type Scheduler struct {
 	maxDownloads   int
 	isShuttingDown bool
 
+	retryTimer           *time.Timer
+	retryWakeAt          time.Time
+	retryTimerGeneration uint64
+
 	globalLimiter               *transport.RateLimiter
 	downloadLimiters            map[string]*transport.RateLimiter
 	defaultDownloadRateLimitBps int64
 	shutdownOnce                sync.Once
+
+	// Test-only seam for pinning the post-download window: fires after
+	// close(ad.done) so Cancel never waits on a parked worker. Single-entry
+	// contract: at most one worker may enter an armed instance.
+	workerDoneGate atomic.Pointer[func()]
+}
+
+// PauseResult describes the download state that Pause changed.
+type PauseResult struct {
+	Found        bool
+	QueuedConfig *types.DownloadRecord
 }
 
 var (
@@ -139,20 +155,86 @@ func resolveDestPath(cfg *types.DownloadRecord) string {
 	return destPath
 }
 
-// Add adds a new download task to the pool. The caller (LifecycleManager) is
-// responsible for emitting any lifecycle events (e.g. DownloadQueuedMsg).
-func (p *Scheduler) Add(cfg types.DownloadRecord) {
+// Add queues cfg and reports whether it was accepted: an ID is owned by at
+// most one queued or active entry at a time, so a same-ID add or one racing
+// the shutdown sweep is refused. The caller (LifecycleManager) is responsible
+// for emitting lifecycle events (e.g. DownloadQueuedMsg).
+func (p *Scheduler) Add(cfg types.DownloadRecord) bool {
+	accepted, _ := p.AddWithPreparation(cfg, nil)
+	return accepted
+}
+
+// AddWithPreparation checks admission before preparing persistence and events,
+// then makes the task runnable. prepare runs under the scheduler lock and must
+// not call scheduler methods. If it fails, no task is queued.
+func (p *Scheduler) AddWithPreparation(cfg types.DownloadRecord, prepare func() error) (bool, error) {
+	return p.addPrepared(cfg, prepare, nil)
+}
+
+// AddWithBeforeStart reserves admission, then runs beforeStart without holding
+// the scheduler mutex. Workers cannot start this task until the callback returns.
+// Cancellation or shutdown during the callback prevents the task from starting.
+func (p *Scheduler) AddWithBeforeStart(cfg types.DownloadRecord, beforeStart func() error) (bool, error) {
+	return p.addPrepared(cfg, nil, beforeStart)
+}
+
+func (p *Scheduler) addPrepared(cfg types.DownloadRecord, prepare, beforeStart func() error) (bool, error) {
 	if cfg.ProgressCh == nil {
 		cfg.ProgressCh = p.progressCh
 	}
 	p.mu.Lock()
+	if p.isShuttingDown {
+		p.mu.Unlock()
+		utils.Debug("Scheduler: Add refused for %s: shutting down", cfg.ID)
+		return false, nil
+	}
+	// A queued entry owns the ID even while inFlight — the claiming worker
+	// settles its wait-group count itself.
+	if _, exists := p.queued[cfg.ID]; exists {
+		p.mu.Unlock()
+		utils.Debug("Scheduler: Add refused for %s: ID already queued", cfg.ID)
+		return false, nil
+	}
+	if _, exists := p.downloads[cfg.ID]; exists {
+		p.mu.Unlock()
+		utils.Debug("Scheduler: Add refused for %s: ID already active", cfg.ID)
+		return false, nil
+	}
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			p.mu.Unlock()
+			return false, err
+		}
+	}
 	p.ensureLimiterForConfigLocked(&cfg)
-	qt := &queuedTask{cfg: cfg}
+	qt := &queuedTask{cfg: cfg, inFlight: beforeStart != nil}
 	p.queued[cfg.ID] = qt
 	p.queueOrder = append(p.queueOrder, cfg.ID)
 	p.wg.Add(1)
+	if beforeStart != nil {
+		p.mu.Unlock()
+		err := beforeStart()
+		p.mu.Lock()
+		if p.queued[cfg.ID] != qt {
+			// Pause, cancellation, or shutdown removed the reservation. As with an
+			// in-flight worker, the callback owner settles its own wait-group count.
+			p.mu.Unlock()
+			p.wg.Done()
+			return false, err
+		}
+		if err != nil {
+			delete(p.queued, cfg.ID)
+			p.removeQueueOrderLocked(cfg.ID)
+			delete(p.downloadLimiters, cfg.ID)
+			p.mu.Unlock()
+			p.wg.Done()
+			return false, err
+		}
+		qt.inFlight = false
+	}
 	p.taskCond.Signal()
 	p.mu.Unlock()
+	return true, nil
 }
 
 func (p *Scheduler) ensureLimiterForConfigLocked(cfg *types.DownloadRecord) {
@@ -263,32 +345,72 @@ func (p *Scheduler) GetAll() []types.DownloadRecord {
 	return configs
 }
 
-// Pause pauses a specific download by ID. Returns true if found and pause initiated
-// (or already paused), false otherwise. Pure mechanical operation - no events emitted.
-func (p *Scheduler) Pause(downloadID string) bool {
-	p.mu.RLock()
+// Pause pauses a specific download by ID. A queued download is removed before a
+// worker can start it; an in-flight worker will observe its removal and balance
+// the wait group itself. No lifecycle events are emitted by the scheduler.
+func (p *Scheduler) Pause(downloadID string) PauseResult {
+	p.mu.Lock()
+	if queued, exists := p.queued[downloadID]; exists {
+		queuedConfig := queued.cfg
+		if queuedConfig.ProgressState != nil {
+			state := progress.CfgProgress(&queuedConfig)
+			queuedConfig.Downloaded, _, _, _, _, _ = state.GetProgress()
+			queuedConfig.RateLimit, queuedConfig.RateLimitSet = state.GetRateLimit()
+		}
+		queuedConfig.Limiter = nil
+
+		delete(p.queued, downloadID)
+		p.removeQueueOrderLocked(downloadID)
+		delete(p.downloadLimiters, downloadID)
+		inFlight := queued.inFlight
+		p.mu.Unlock()
+
+		if !inFlight {
+			p.wg.Done()
+		}
+		return PauseResult{Found: true, QueuedConfig: &queuedConfig}
+	}
+
 	ad, exists := p.downloads[downloadID]
-	p.mu.RUnlock()
+	var configTotal int64
+	if exists && ad != nil {
+		configTotal = ad.config.TotalSize
+	}
+	p.mu.Unlock()
 
 	if !exists || ad == nil {
-		return false
+		return PauseResult{}
 	}
 
 	// Set paused flag and cancel context
 	if ad.config.ProgressState != nil {
+		prog := progress.CfgProgress(&ad.config)
+
+		// Completion boundary guard: if done or verified progress reached positive total, no-op return true.
+		if prog.Done.Load() {
+			return PauseResult{Found: true}
+		}
+		total := prog.Bytes.TotalSize.Load()
+		if total <= 0 {
+			total = configTotal
+		}
+		if total > 0 && prog.Bytes.VerifiedProgress.Load() >= total && !prog.Verifying.Load() {
+			return PauseResult{Found: true}
+		}
+
 		// Idempotency: If already paused, do nothing.
-		if progress.CfgProgress(&ad.config).IsPaused() {
-			return true
+		if prog.IsPaused() {
+			return PauseResult{Found: true}
 		}
 		// If transition is already in progress, still ensure worker context is canceled.
-		if progress.CfgProgress(&ad.config).IsPausing() {
+		if prog.IsPausing() {
 			if ad.cancel != nil {
 				ad.cancel()
 			}
-			return true
+			return PauseResult{Found: true}
 		}
-		progress.CfgProgress(&ad.config).SetPausing(true) // Mark as transitioning to pause
-		progress.CfgProgress(&ad.config).Pause()
+		prog.SetPausing(true) // Mark as transitioning to pause
+		prog.Pause()
 	}
 	// Always cancel worker context as a safety net (single downloader does not set state cancel itself).
 	if ad.cancel != nil {
@@ -297,7 +419,7 @@ func (p *Scheduler) Pause(downloadID string) bool {
 
 	// Send pause message is now exclusively handled by worker return paths
 	// to ensure fully synchronized byte counts.
-	return true
+	return PauseResult{Found: true}
 }
 
 // SetGlobalRateLimit updates the global rate limiter (bytes/sec). Use 0 to disable.
@@ -310,6 +432,17 @@ func (p *Scheduler) SetGlobalRateLimit(rate int64) {
 	// All per-download MultiLimiters hold a pointer to this globalLimiter,
 	// so updating the rate here propagates to all active downloads instantly.
 	p.globalLimiter.SetRate(rate, rateLimiterBurst(rate))
+}
+
+// GlobalRateLimit returns the active global limit in bytes per second.
+func (p *Scheduler) GlobalRateLimit() int64 {
+	p.mu.RLock()
+	limiter := p.globalLimiter
+	p.mu.RUnlock()
+	if limiter == nil {
+		return 0
+	}
+	return limiter.Rate()
 }
 
 // SetDefaultDownloadRateLimit updates the default per-download rate limit (bytes/sec).
@@ -483,6 +616,7 @@ func (p *Scheduler) Cancel(downloadID string) types.CancelResult {
 	var droppedQueued bool
 	if queuedExists {
 		delete(p.queued, downloadID)
+		p.removeQueueOrderLocked(downloadID)
 		if !qCfg.inFlight {
 			droppedQueued = true
 		}
@@ -616,28 +750,82 @@ func (p *Scheduler) ClearExtractionIdentity(downloadID string) error {
 	return nil
 }
 
-func (p *Scheduler) waitForTask() string {
+func (p *Scheduler) armRetryTimerLocked(earliest time.Time) {
+	if earliest.IsZero() {
+		if p.retryTimer != nil {
+			p.retryTimer.Stop()
+			p.retryTimer = nil
+		}
+		p.retryWakeAt = time.Time{}
+		return
+	}
+
+	if !p.retryWakeAt.IsZero() && p.retryWakeAt.Equal(earliest) {
+		return
+	}
+
+	if p.retryTimer != nil {
+		p.retryTimer.Stop()
+	}
+
+	p.retryTimerGeneration++
+	gen := p.retryTimerGeneration
+	p.retryWakeAt = earliest
+
+	delay := time.Until(earliest)
+	if delay < 0 {
+		delay = 0
+	}
+
+	p.retryTimer = time.AfterFunc(delay, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		if p.isShuttingDown || gen != p.retryTimerGeneration || !p.retryWakeAt.Equal(earliest) {
+			return
+		}
+
+		p.retryWakeAt = time.Time{}
+		p.retryTimer = nil
+		p.taskCond.Broadcast()
+	})
+}
+
+// waitForTask claims the next eligible queued task with inFlight set. The
+// caller must re-verify p.queued still holds this exact task: a removal
+// plus same-ID re-add is indistinguishable by ID.
+func (p *Scheduler) waitForTask() *queuedTask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for {
 		if p.isShuttingDown {
-			return ""
+			return nil
 		}
+		now := time.Now()
+		var earliestPending time.Time
+
 		for _, id := range p.queueOrder {
 			if qt, ok := p.queued[id]; ok && !qt.inFlight {
-				qt.inFlight = true
-				return id
+				if qt.retryAt.IsZero() || !now.Before(qt.retryAt) {
+					qt.inFlight = true
+					return qt
+				}
+				if earliestPending.IsZero() || qt.retryAt.Before(earliestPending) {
+					earliestPending = qt.retryAt
+				}
 			}
 		}
+
+		p.armRetryTimerLocked(earliestPending)
 		p.taskCond.Wait()
 	}
 }
 
 func (p *Scheduler) worker() {
 	for {
-		id := p.waitForTask()
-		if id == "" {
+		qt := p.waitForTask()
+		if qt == nil {
 			return
 		}
 
@@ -645,11 +833,25 @@ func (p *Scheduler) worker() {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		p.mu.Lock()
-		qt, stillQueued := p.queued[id]
-		if !stillQueued {
+		// qt.cfg is rewritten wholesale under p.mu elsewhere; read the ID in the lock.
+		id := qt.cfg.ID
+		// A same-ID entry is a replacement this claim must not adopt.
+		if qtNow, stillQueued := p.queued[id]; !stillQueued || qtNow != qt {
 			p.mu.Unlock()
 			cancel()
 			p.wg.Done()
+			continue
+		}
+
+		// A same-ID active entry registered during the claim window owns the
+		// ID; void this claim and drop its queued entry so it cannot linger.
+		if _, occupied := p.downloads[id]; occupied {
+			delete(p.queued, id)
+			p.removeQueueOrderLocked(id)
+			p.mu.Unlock()
+			cancel()
+			p.wg.Done()
+			utils.Debug("Scheduler: claim for %s dropped: ID already has an active download", id)
 			continue
 		}
 
@@ -682,18 +884,23 @@ func (p *Scheduler) worker() {
 		ad.running.Store(false)
 		close(ad.done) // unblock any Cancel caller waiting for this worker to exit
 
-		// Sync back mutated fields cleanly under lock
+		if g := p.workerDoneGate.Load(); g != nil {
+			(*g)()
+		}
+
+		// Sync mutated fields back only into a slot this worker still owns.
 		p.mu.Lock()
-		if _, exists := p.downloads[localCfg.ID]; exists {
+		if p.downloads[localCfg.ID] == ad {
 			ad.config.TotalSize = localCfg.TotalSize
 			ad.config.SupportsRange = localCfg.SupportsRange
 			ad.config.Runtime = localCfg.Runtime
 		}
 		p.mu.Unlock()
 
-		// Logic:
-		// 1. If Pause() was called: State.IsPaused() is true. We keep the task in p.downloads (so it can be resumed).
-		// 2. If finished/error: We remove from p.downloads.
+		// Outcome priority:
+		// 1. If err == nil (successful download): Clear stale pause, mark Done, remove from downloads.
+		// 2. If paused (ErrPaused or pause requested with cancel): Keep in downloads for potential resume.
+		// 3. If other error: Retry or emit EventError.
 
 		isPaused := localCfg.ProgressState != nil && progress.CfgProgress(&localCfg).IsPaused()
 
@@ -702,16 +909,43 @@ func (p *Scheduler) worker() {
 			progress.CfgProgress(&localCfg).SetPausing(false)
 		}
 
-		if isPaused {
+		// A clean pause outcome only occurs on typed ErrPaused or when a pause was requested
+		// and the download terminated due to context cancellation.
+		isPauseResult := errors.Is(err, types.ErrPaused) || (isPaused && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)))
+
+		if err == nil {
+			// Physical success takes precedence over late-arriving pause signals.
+			// Clear any stale paused flag, mark Done, and remove from tracking maps.
+			if localCfg.ProgressState != nil {
+				prog := progress.CfgProgress(&localCfg)
+				prog.Paused.Store(false)
+				prog.Done.Store(true)
+			}
+			p.mu.Lock()
+			// A same-ID replacement registered after our claim keeps its slot.
+			if p.downloads[localCfg.ID] == ad {
+				delete(p.downloads, localCfg.ID)
+				delete(p.downloadLimiters, localCfg.ID)
+			}
+			p.mu.Unlock()
+		} else if isPauseResult {
 			utils.Debug("Scheduler: Download %s paused cleanly", localCfg.ID)
 			sendPausedFallback(localCfg.ProgressCh, &localCfg, err, p.progressDone)
-		} else if err != nil {
+		} else {
 			p.mu.Lock()
-			delete(p.downloads, localCfg.ID)
+			// A same-ID replacement registered during the run owns the ID:
+			// our stale task must not requeue over it or emit events into it.
+			ownedSlot := p.downloads[localCfg.ID] == ad
+			if ownedSlot {
+				delete(p.downloads, localCfg.ID)
+			}
+			_, slotTaken := p.queued[localCfg.ID]
+			foreignActive := p.downloads[localCfg.ID] != nil
 
-			if shouldRetryFailedDownload(p.isShuttingDown, err, qt.retries) {
+			if shouldRetryFailedDownload(p.isShuttingDown, err, qt.retries) && !slotTaken && !foreignActive {
 				qt.retries++
 				retryDelay := time.Second * time.Duration(qt.retries)
+				qt.retryAt = time.Now().Add(retryDelay)
 				qt.inFlight = true // Keep in-flight while sending progress outside lock
 				qt.cfg = localCfg
 				p.queued[localCfg.ID] = qt
@@ -731,28 +965,45 @@ func (p *Scheduler) worker() {
 						Mirrors:      localCfg.Mirrors,
 						RateLimit:    localCfg.RateLimit,
 						RateLimitSet: localCfg.RateLimitSet,
-						Workers:      localCfg.Workers,
-						MinChunkSize: localCfg.MinChunkSize,
+						Workers:      localCfg.Runtime.GetWorkers(),
+						MinChunkSize: localCfg.Runtime.GetMinChunkSize(),
 					}, p.progressDone)
 				}
 
 				p.mu.Lock()
-				if _, ok := p.queued[localCfg.ID]; ok {
+				// The entry must still be this task, not a same-ID replacement.
+				if current, ok := p.queued[localCfg.ID]; ok && current == qt {
 					qt.inFlight = false
-					p.queued[localCfg.ID] = qt
+
+					now := time.Now()
+					var earliestPending time.Time
+					for _, qid := range p.queueOrder {
+						if t, ok := p.queued[qid]; ok && !t.inFlight && !t.retryAt.IsZero() {
+							if t.retryAt.After(now) {
+								if earliestPending.IsZero() || t.retryAt.Before(earliestPending) {
+									earliestPending = t.retryAt
+								}
+							}
+						}
+					}
+					p.armRetryTimerLocked(earliestPending)
 				} else {
 					// GracefulShutdown or Cancel removed it while we were unlocked.
 					// Since we were in-flight, they didn't decrement wg, so we must.
 					p.wg.Done()
 				}
-				p.taskCond.Signal()
+				p.taskCond.Broadcast()
 				p.mu.Unlock()
-				// ponytail: naive backoff blocks worker thread, but naturally limits retry storms
-				select {
-				case <-time.After(retryDelay):
-				case <-p.progressDone:
-					// Wake up early if shutting down
-				}
+				continue
+			}
+
+			if slotTaken || foreignActive {
+				// The replacement owns the ID and its event stream; settle
+				// our wait-group count without touching its limiter entry.
+				p.wg.Done()
+				p.taskCond.Broadcast()
+				p.mu.Unlock()
+				utils.Debug("Scheduler: worker for %s settles stale claim: ID taken by same-ID replacement", localCfg.ID)
 				continue
 			}
 
@@ -775,7 +1026,7 @@ func (p *Scheduler) worker() {
 				if finalFilename == "" {
 					finalFilename = localCfg.Filename
 				}
-				errEvent = &types.DownloadEvent{
+				errEvent = &types.DownloadEvent{Artifact: localCfg.Artifact,
 					Type:       types.EventError,
 					DownloadID: localCfg.ID,
 					Filename:   finalFilename,
@@ -783,6 +1034,7 @@ func (p *Scheduler) worker() {
 					Err:        err,
 				}
 				if localCfg.ProgressState != nil {
+					errEvent.Downloaded = progress.CfgProgress(&localCfg).Bytes.Downloaded.Load()
 					if pending := progress.CfgProgress(&localCfg).TakePendingResumeState(); pending != nil {
 						errEvent.State = pending
 						if pending.Downloaded > 0 {
@@ -795,7 +1047,9 @@ func (p *Scheduler) worker() {
 			if !isCancel && localCfg.ProgressState != nil {
 				progress.CfgProgress(&localCfg).SetError(err)
 			}
-			delete(p.downloadLimiters, localCfg.ID)
+			if ownedSlot {
+				delete(p.downloadLimiters, localCfg.ID)
+			}
 			p.mu.Unlock()
 
 			// Send outside the lock: safeSendProgress may block on a full
@@ -803,18 +1057,6 @@ func (p *Scheduler) worker() {
 			if errEvent != nil {
 				safeSendProgress(localCfg.ProgressCh, *errEvent, p.progressDone)
 			}
-		} else {
-			// Only mark as done if not paused
-			if localCfg.ProgressState != nil {
-				progress.CfgProgress(&localCfg).Done.Store(true)
-			}
-			// Note: DownloadCompleteMsg is sent by the progress reporter when it detects Done=true
-
-			// Clean up from tracking
-			p.mu.Lock()
-			delete(p.downloads, localCfg.ID)
-			delete(p.downloadLimiters, localCfg.ID)
-			p.mu.Unlock()
 		}
 		// If paused, we keep it in downloads map for potential resume
 		p.wg.Done()
@@ -835,9 +1077,9 @@ func sendPausedFallback(ch chan<- types.DownloadEvent, cfg *types.DownloadRecord
 		downloaded = state.Bytes.Downloaded.Load()
 		rateLimit, rateLimitSet = state.GetRateLimit()
 	}
-	// A nil error and no pending snapshot means the concurrent downloader
-	// already queued EventPaused and consumed the delivery handshake.
-	if runErr == nil && pending == nil {
+	// A nil error (or typed ErrPaused) and no pending snapshot means the
+	// concurrent downloader already queued EventPaused and consumed the delivery handshake.
+	if (runErr == nil || errors.Is(runErr, types.ErrPaused)) && pending == nil {
 		return
 	}
 
@@ -874,7 +1116,13 @@ func shouldRetryFailedDownload(isShuttingDown bool, err error, retries int) bool
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	if errors.Is(err, types.ErrIntegrityMismatch) || errors.Is(err, types.ErrDestinationExists) || errors.Is(err, types.ErrCompleted) {
+		return false
+	}
 	if types.IsPermanentHTTPError(err) {
+		return false
+	}
+	if errors.Is(err, types.ErrRetryBudgetExceeded) {
 		return false
 	}
 	if types.IsInsufficientDiskSpace(err) {
@@ -889,6 +1137,8 @@ func (p *Scheduler) GetStatus(id string) *types.DownloadStatus {
 	var adRateLimitBps int64
 	var adRateLimitSet bool
 	var adState *progress.DownloadProgress
+	var capacity int
+	var retryAt time.Time
 	var queuedCfg types.DownloadRecord
 
 	p.mu.RLock()
@@ -896,8 +1146,12 @@ func (p *Scheduler) GetStatus(id string) *types.DownloadStatus {
 	qCfg, qExists := p.queued[id]
 	if qExists {
 		queuedCfg = qCfg.cfg
+		retryAt = qCfg.retryAt
 	}
 	if exists {
+		if ad.config.Runtime != nil {
+			capacity = ad.config.Runtime.GetMaxConnectionsPerDownload()
+		}
 		adURL = ad.config.URL
 		adFilename = ad.config.Filename
 		adDestPath = ad.config.DestPath
@@ -912,7 +1166,11 @@ func (p *Scheduler) GetStatus(id string) *types.DownloadStatus {
 	}
 
 	if qExists {
-		return &types.DownloadStatus{
+		phase := "queued"
+		if retryAt.After(time.Now()) {
+			phase = "retrying"
+		}
+		return &types.DownloadStatus{Phase: phase,
 			ID:           id,
 			URL:          queuedCfg.URL,
 			Filename:     queuedCfg.Filename,
@@ -937,9 +1195,9 @@ func (p *Scheduler) GetStatus(id string) *types.DownloadStatus {
 	}
 
 	// Calculate progress and speed (thread-safe)
-	downloaded, totalSize, _, sessionElapsed, _, sessionStart := state.GetProgress()
+	downloaded, totalSize, _, sessionElapsed, connections, sessionStart := state.GetProgress()
 
-	status := &types.DownloadStatus{
+	status := &types.DownloadStatus{MaxConnections: capacity, Connections: int(connections),
 		ID:           id,
 		URL:          adURL,
 		Filename:     filename,
@@ -955,6 +1213,9 @@ func (p *Scheduler) GetStatus(id string) *types.DownloadStatus {
 		status.DestPath = adDestPath
 	}
 
+	if state.Verifying.Load() {
+		status.Status = "verifying"
+	}
 	if state.IsPausing() {
 		status.Status = "pausing"
 	} else if state.IsPaused() {
@@ -995,6 +1256,7 @@ func (p *Scheduler) GracefulShutdown() {
 		// Workers already guard against this with the p.queued check at loop entry,
 		// so clearing the map here is sufficient; draining taskChan is belt-and-suspenders.
 		p.mu.Lock()
+		p.armRetryTimerLocked(time.Time{})
 		for id, qt := range p.queued {
 			delete(p.queued, id)
 			if !qt.inFlight {

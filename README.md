@@ -72,10 +72,11 @@ Surge is available on multiple platforms. Choose the method that works best for 
 | Platform / Method                  | Command / Instructions                                                           | Notes                                        |
 | :--------------------------------- | :------------------------------------------------------------------------------- | :------------------------------------------- |
 | **Prebuilt Binary**          | [Download from Releases](https://github.com/SurgeDM/Surge/releases/latest) | Easiest method. Just download and run.       |
+| **macOS / Linux (Install Script)** | `curl -fsSL https://surgedm.github.io/install \| sh` | Verifies the release checksum and installs to `~/.local/bin`. Run again to update. [Script options](docs/getting-started.md#install-surge). |
 | **Linux AppImage**           | [Download from Releases](https://github.com/SurgeDM/Surge/releases/latest) | Run `chmod +x Surge_..._linux_x86_64.AppImage`, then `./Surge_..._linux_x86_64.AppImage`. Supports delta updates. |
 | **Arch Linux (AUR)**         | `yay -S surge`                                                                 | Managed via AUR.                             |
 | **macOS / Linux (Homebrew)** | `brew install SurgeDM/tap/surge`                                      | Recommended for Mac/Linux users.             |
-| **Nix / NixOS**              | `nix run github:SurgeDM/Surge`                                        | Via Nix flake. NixOS config: `inputs.surge.packages.${pkgs.system}.default` |
+| **Nix / NixOS**              | `nix profile install --refresh github:SurgeDM/Surge`                   | Installs the official release and adds `surge` to your Nix profile. [Nix instructions](docs/getting-started.md#nix-installation-and-updates). |
 | **Windows**         | `winget install surge-downloader.surge`<br />or<br />`scoop install surge`<br />or<br />`choco install surge` | Recommended for Windows users.               |
 | **Dockerfile**               | [See instructions](#4-server-mode-with-docker-compose)                              | Run Surge in server mode with Docker Compose |
 | **Go Install**               | `go install github.com/SurgeDM/Surge@latest`                          | Requires Go 1.25+                           |
@@ -108,6 +109,8 @@ surge https://example.com/file.zip --batch urls.txt
 
 `--no-server` keeps the TUI fully local and skips the embedded HTTP API. CLI control commands such as `surge add`, `surge pause`, and browser-extension requests will not be able to target that instance.
 
+The **All** tab (`0`) shows downloads in every state. The existing Queued (`q`), Active (`w`), and Done (`e`) tabs keep their filters. Tab/Shift+Tab cycle through all four tabs, and search, category filters, and tab pinning work in All too.
+
 ### 2. Server Mode (Headless)
 
 Great for servers, Raspberry Pis, or background processes.
@@ -125,38 +128,41 @@ surge server --token <token>
 
 ### 3. Auto-Start Service
 
-Surge provides an official way to manage it as a system service (daemon). This is the recommended way for servers and reproducible deployments.
+Surge can run as a service owned by the current user. It uses the same settings,
+download database, category paths, and API token as that user's CLI and TUI.
 
 ```bash
-# Install Surge as a system service
+# Install and immediately start the user service
 surge service install
 
 # Manage the service
 surge service start
 surge service stop
+surge service restart
 surge service status
-surge service token
 
 # Uninstall the service
 surge service uninstall
 ```
 
 > [!NOTE]
-> On Linux, these commands may require `sudo`. On Windows, they should be run in an elevated (Administrator) terminal.
+> [!IMPORTANT]
+> Run these commands as your normal user, without `sudo` or an Administrator
+> terminal. Surge refuses to install a user service as root. The service starts
+> with your login session; see the [service guide](docs/guides/run-as-a-service.md)
+> for platform details and legacy system-service migration.
 
 ### 4. Remote TUI
 
 `surge` and `surge server` bind the HTTP API to `0.0.0.0` (all interfaces) by default.
 This means the server is accessible via `localhost` (127.0.0.1) as well as your local network IP.
+To accept connections from this machine only, run `surge config Network.bind_host 127.0.0.1` and restart Surge.
 
 The API is token-protected. Generate/read your token by running:
 
 ```bash
-# Get the standard token
+# Get the current user's token (the service uses the same token)
 surge token
-
-# Get the token if Surge is installed as a system service
-surge service token
 ```
 
 Alternatively, you can find it in the TUI under **Settings > Extension**.
@@ -275,7 +281,7 @@ requests, and peak accepted concurrency.
 The Surge extension intercepts browser downloads and sends them straight to your terminal. It communicates with the Surge client on port **1700** by default.
 
 > [!IMPORTANT]
-> An **Auth Token** is required to connect the extension to your Surge server. This can be obtained from the TUI under **Settings > Extension**, or by running `surge token` (or `surge service token` if installed as a system service).
+> An **Auth Token** is required to connect the extension to your Surge server. This can be obtained from the TUI under **Settings > Extension**, or by running `surge token` as the user who runs Surge.
 
 ### Chrome / Edge / Brave
 
@@ -315,6 +321,8 @@ Huge thanks to the teams and sponsors helping us build and ship Surge:
 
 We love community contributions! Whether it's a bug fix, a new feature, or just cleaning up typos.
 PRs are always welcome. For a quick guide, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+For internal TUI visual checks, run `./scripts/visual-test.sh`. The fixture uses the production TUI and is compiled only into a temporary test binary. See [Visual testing](docs/development/visual-testing.md).
 
 You can check out the [Discussions](https://github.com/SurgeDM/Surge/discussions) for any questions or ideas, or follow us on [X (Twitter)](https://x.com/SurgeDownloader)!
 

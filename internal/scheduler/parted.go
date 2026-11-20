@@ -53,7 +53,12 @@ type streamSpec struct {
 // downloader ended up with.
 func acquireStream(ctx context.Context, cfg *types.DownloadRecord, progState *progress.DownloadProgress, spec streamSpec) (int64, error) {
 	totalSize := spec.totalSize
+	// Range-capable transfers stay in the range pipeline even with one worker
+	// so fresh downloads remain resumable.
 	useConcurrent := spec.supportsRange
+	// Only the record's own stream owns its resume state; a part's snapshot is
+	// dropped after every run, so a part restarts from zero anyway.
+	ownsRecord := spec.id == cfg.ID
 	var downloadErr error
 
 	if useConcurrent {
@@ -81,11 +86,13 @@ func acquireStream(ctx context.Context, cfg *types.DownloadRecord, progState *pr
 		}
 
 		d := concurrent.NewConcurrentDownloader(spec.id, spec.progressCh, progState, cfg.Runtime)
+		d.ImportThrottleState(cfg)
 		d.Headers = spec.headers
 		d.Limiter = cfg.Limiter
 		d.RateLimitBps = cfg.RateLimit
 		d.RateLimitSet = cfg.RateLimitSet
 		downloadErr = d.Download(ctx, spec.url, spec.mirrors, activeMirrors, spec.destPath, totalSize)
+		d.ExportThrottleState(cfg)
 		if d.TotalSize > 0 {
 			totalSize = d.TotalSize
 		}
@@ -95,26 +102,58 @@ func acquireStream(ctx context.Context, cfg *types.DownloadRecord, progState *pr
 			downloaded = progState.Bytes.Downloaded.Load()
 		}
 
-		// Fall back only when nothing landed: a partial concurrent transfer
-		// must not be discarded.
+		// Only confirmed lack of range support warrants restarting from byte zero.
 		if shouldFallbackToSingle(downloadErr, downloaded) {
 			utils.Debug("Concurrent download failed: %v - falling back to single-threaded", downloadErr)
 			useConcurrent = false
 			if progState != nil {
 				progState.SessionReset()
 			}
-			_ = os.Truncate(spec.destPath+types.IncompleteSuffix, 0)
+
+			// Truncate the working file to zero to prevent stale tail bytes
+			// from the failed concurrent session.
+			if err := os.Truncate(spec.destPath+types.IncompleteSuffix, 0); err != nil {
+				return totalSize, fmt.Errorf("reset working file for range fallback: %w", err)
+			}
+			// The range checkpoint describes bytes discarded by the restart.
+			// Retain metadata and headers, but invalidate its offsets and bitmap.
+			if checkpoint, err := store.LoadState(spec.url, spec.destPath); err == nil && checkpoint != nil {
+				checkpoint.Tasks = nil
+				checkpoint.ChunkBitmap = nil
+				checkpoint.ActualChunkSize = 0
+				checkpoint.Downloaded = 0
+				checkpoint.Elapsed = 0
+				checkpoint.FileHash = ""
+				if err := store.SaveStateWithOptions(spec.url, spec.destPath, checkpoint, store.SaveStateOptions{SkipFileHash: true}); err != nil {
+					return totalSize, fmt.Errorf("invalidate range checkpoint for fallback: %w", err)
+				}
+			}
+			if ownsRecord {
+				cfg.SupportsRange = false
+				cfg.IsResume = false
+				cfg.Tasks = nil
+				cfg.ChunkBitmap = nil
+				cfg.Downloaded = 0
+			}
+			if progState != nil {
+				progState.TakePendingResumeState()
+			}
 		}
 	}
 
 	if !useConcurrent {
 		utils.Debug("Using single-threaded downloader for %s", spec.filename)
 		d := single.NewSingleDownloader(spec.id, spec.progressCh, progState, cfg.Runtime)
+		d.ImportThrottleState(cfg)
 		d.Headers = spec.headers
 		d.Limiter = cfg.Limiter
 		downloadErr = d.Download(ctx, spec.url, spec.destPath, totalSize, spec.filename)
+		d.ExportThrottleState(cfg)
 		if d.TotalSize > 0 {
 			totalSize = d.TotalSize
+		}
+		if downloadErr != nil {
+			utils.Debug("Single-threaded download failed: %v", downloadErr)
 		}
 	}
 

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -13,10 +14,8 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
-
-// Viewport layout
-const maxUIDuration = 30 * 24 * time.Hour
 
 // formatDurationForUI formats a duration as a human-readable clock string.
 // Returns "M:SS" for sub-hour durations, "H:MM:SS" for multi-hour, "Xd Yh" for days.
@@ -24,11 +23,7 @@ func formatDurationForUI(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
-	if d >= maxUIDuration {
-		return "\u221e"
-	}
-
-	totalSec := int(d.Seconds())
+	totalSec := int64(d / time.Second)
 
 	if totalSec >= 86400 {
 		days := totalSec / 86400
@@ -49,24 +44,37 @@ func formatDurationForUI(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", mins, secs)
 }
 
-// renderModalWithOverlay renders a modal centered on screen with a dark overlay effect
+// renderModalWithOverlay renders a modal centered on the themed surface.
 func (m RootModel) renderModalWithOverlay(modal string) string {
-	// Place modal centered with dark gray background fill for overlay effect
+	style := lipgloss.NewStyle()
+	if !m.transparentBackground() {
+		style = style.Background(colors.Background())
+	}
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal,
-		lipgloss.WithWhitespaceChars(" "), // Changed from "░" to avoid terminal rendering glitches
-		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Background(lipgloss.Color("236"))),
-	)
+		lipgloss.WithWhitespaceChars(" "), lipgloss.WithWhitespaceStyle(style))
+}
+
+func (m RootModel) transparentBackground() bool {
+	return m.Settings != nil && m.Settings.General.TransparentBackground != nil && config.Resolve[bool](m.Settings.General.TransparentBackground)
 }
 
 func (m RootModel) wrapView(content string) tea.View {
 	v := tea.NewView(content)
 	v.AltScreen = true
+	if !m.transparentBackground() {
+		v.BackgroundColor = colors.Background()
+	}
+	v.ForegroundColor = colors.Foreground()
 	return v
 }
 
 func (m RootModel) View() tea.View {
 	if m.width == 0 {
 		return m.wrapView("Loading...")
+	}
+
+	if m.state == QuitConfirmState && (m.width < MinTermWidth || m.height < MinTermHeight) {
+		return m.wrapView(m.viewCompactQuitConfirm())
 	}
 
 	// Terminal too small to render any meaningful layout
@@ -163,6 +171,10 @@ func (m RootModel) View() tea.View {
 
 	if m.state == SpeedLimitsState {
 		return m.wrapView(m.renderModalWithOverlay(m.viewSpeedLimits()))
+	}
+
+	if m.state == CategoryMoveConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewCategoryMoveConfirm()))
 	}
 
 	if m.state == CategoryPickerState {
@@ -328,6 +340,9 @@ func (m RootModel) View() tea.View {
 	if m.state == QuitConfirmState {
 		return m.wrapView(m.renderModalWithOverlay(m.viewQuitConfirm()))
 	}
+	if m.state == SettingsConfirmState {
+		return m.wrapView(m.renderModalWithOverlay(m.viewSettingsConfirmation()))
+	}
 
 	if m.state == RestartConfirmState {
 		return m.wrapView(m.renderModalWithOverlay(m.viewRestartConfirm()))
@@ -385,6 +400,8 @@ func (m RootModel) View() tea.View {
 		w, h := GetDynamicModalDimensions(m.width, m.height, 40, 10, PopupWidth, 22)
 		modal := components.HelpModal{
 			Title:       "Keyboard Shortcuts",
+			Query:       m.helpSearchQuery,
+			SearchTitle: m.helpSearchTitle(),
 			HelpKeys:    m.keys.Dashboard,
 			Help:        m.help,
 			BorderColor: colors.Cyan(),
@@ -420,7 +437,7 @@ func (m RootModel) View() tea.View {
 	var limitVal string
 	if m.Settings != nil && m.Settings.Network.GlobalRateLimit != nil {
 		if rate, err := utils.ParseRateLimitValue(m.Settings.Network.GlobalRateLimit.Value); err == nil && rate > 0 {
-			limitVal = lipgloss.NewStyle().Foreground(colors.LightGray()).Render(utils.FormatRateLimit(rate))
+			limitVal = lipgloss.NewStyle().Foreground(colors.LightGray()).Render(utils.FormatRateLimitDisplay(rate))
 		}
 	}
 	var limitChunk string
@@ -437,12 +454,10 @@ func (m RootModel) View() tea.View {
 	}
 	powerChunk := lipgloss.NewStyle().
 		Foreground(powerColor).
-		Width(3).
-		Align(lipgloss.Center).
 		Render("\u23fb")
 
 	// Version indicator
-	versionBlue := colors.ThemeColor("#005cc5", "#58a6ff")
+	versionBlue := colors.StateVersion()
 	versionChunk := lipgloss.NewStyle().Foreground(versionBlue).Render(fmt.Sprintf("v%s", m.CurrentVersion))
 
 	rightFooter := lipgloss.NewStyle().PaddingRight(2).Render(lipgloss.JoinHorizontal(lipgloss.Center,
@@ -486,12 +501,13 @@ func (m RootModel) View() tea.View {
 	}
 
 	// Pre-compute details content to avoid double-computation and width mismatches
-	var detailContent string
+	var detailContent, detailStatus string
 	detailWidth := layout.RightWidth
 	if layout.HideRightColumn {
 		detailWidth = layout.LeftWidth
 	}
 	if selected != nil {
+		detailStatus = " " + getDownloadStatus(selected, m.spinner.View()) + " "
 		detailContent = renderFocusedDetails(selected, detailWidth-components.BorderFrameWidth, m.spinner.View())
 	} else {
 		detailContent = renderEmptyMessage(detailWidth-components.BorderFrameWidth, layout.DetailHeight-components.BorderFrameHeight, "No download selected")
@@ -542,7 +558,7 @@ func (m RootModel) View() tea.View {
 		} else if layout.GraphHeight > 0 {
 			layout.DetailHeight += layout.GraphHeight
 		}
-		detailBox := renderBtopBox("", PaneTitleStyle.Render(" File Details "), detailContent, layout.RightWidth, layout.DetailHeight, colors.Gray())
+		detailBox := renderBtopBox(detailStatus, PaneTitleStyle.Render(" File Details "), detailContent, layout.RightWidth, layout.DetailHeight, colors.Gray())
 
 		var rightParts []string
 		if showGraph {
@@ -561,7 +577,7 @@ func (m RootModel) View() tea.View {
 	var body string
 	if layout.HideRightColumn {
 		if layout.VerticalLayout {
-			detailBox := renderBtopBox("", PaneTitleStyle.Render(" File Details "), detailContent, layout.LeftWidth, layout.DetailHeight, colors.Gray())
+			detailBox := renderBtopBox(detailStatus, PaneTitleStyle.Render(" File Details "), detailContent, layout.LeftWidth, layout.DetailHeight, colors.Gray())
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox, detailBox)
 		} else {
 			body = lipgloss.JoinVertical(lipgloss.Left, headerBox, listBox)
@@ -583,7 +599,34 @@ func (m RootModel) View() tea.View {
 	return m.wrapView(lipgloss.Place(layout.AvailableWidth, m.height, lipgloss.Center, lipgloss.Top, fullView))
 }
 
-// Helper to render the detailed info pane
+func (m RootModel) viewCompactQuitConfirm() string {
+	message := "Are you sure you want to quit?"
+	if m.width < lipgloss.Width(message) {
+		message = "Quit Surge?"
+	}
+	buttons := components.RenderCompactYesNoButtons("Yep!", "Nope", m.quitConfirmFocused, colors.Pink())
+	content := lipgloss.JoinVertical(lipgloss.Center, message, buttons)
+	if m.height == 1 {
+		content = "Quit? " + buttons
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+}
+
+// Download paths belong to the daemon, whose OS can differ from the client's.
+func downloadDirectory(destination string) string {
+	windowsDrive := len(destination) >= 3 && destination[1] == ':' && (destination[2] == '\\' || destination[2] == '/')
+	if windowsDrive || strings.HasPrefix(destination, `\\`) || strings.HasPrefix(destination, "//") {
+		if i := strings.LastIndexAny(destination, `\/`); i >= 0 {
+			if windowsDrive && i == 2 {
+				return destination[:3]
+			}
+			return destination[:i]
+		}
+	}
+	return path.Dir(destination)
+}
+
+// Helper to render the detailed info pane.
 func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	pct := 0.0
 	if d.Total > 0 {
@@ -596,6 +639,7 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 		contentWidth = 0
 	}
 
+	detailValueStyle := lipgloss.NewStyle().Foreground(colors.White())
 	// Separator Style
 	divider := lipgloss.NewStyle().
 		Foreground(colors.Gray()).
@@ -607,25 +651,15 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 		Width(contentWidth).
 		Padding(0, 1)
 
-	// --- 1. Status Section ---
-	statusStr := getDownloadStatus(d, spinnerView)
-	statusStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colors.Gray()).
-		Width(contentWidth).
-		Align(lipgloss.Center)
-
-	statusBox := statusStyle.Render(statusStr)
-
 	// --- 2. File Information Section ---
 	displayFilename := d.Filename
 	if displayFilename == "" || displayFilename == "Queued" {
 		displayFilename = d.URL
 	}
 
-	displayPath := d.Destination
-	if displayPath == "" {
-		displayPath = d.URL
+	displayPath := "Not available"
+	if d.Destination != "" {
+		displayPath = downloadDirectory(d.Destination)
 	}
 
 	// Calculate inner width accounting for sectionStyle padding (0, 1)
@@ -633,17 +667,24 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	if innerWidth < 0 {
 		innerWidth = 0
 	}
-	valueWidth := innerWidth - 12
+	const labelWidth = 6
+	valueWidth := innerWidth - labelWidth
 	if valueWidth < 5 {
-		valueWidth = 5 // Minimum reasonable width
+		valueWidth = 5
+	}
+	field := func(label, value string, style lipgloss.Style) string {
+		labelText := lipgloss.NewStyle().Foreground(colors.LightGray()).Width(labelWidth).Render(label)
+		valueText := style.Width(valueWidth).MaxWidth(valueWidth).Height(2).Render(utils.TruncateTwoLines(value, valueWidth))
+		return lipgloss.JoinHorizontal(lipgloss.Top, labelText, valueText)
 	}
 
 	fileInfoContent := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("URL: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(d.URL, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("File: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(displayFilename, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("Path: "), StatsValueStyle.Width(valueWidth).MaxWidth(valueWidth).Render(utils.TruncateTwoLines(displayPath, valueWidth))),
-		lipgloss.JoinHorizontal(lipgloss.Top, StatsLabelStyle.Render("ID:   "), lipgloss.NewStyle().Foreground(colors.LightGray()).Width(valueWidth).MaxWidth(valueWidth).Render(utils.WrapText(d.ID, valueWidth))),
+		field("File:", displayFilename, detailValueStyle.Bold(true)),
+		field("Path:", displayPath, detailValueStyle),
+		field("ID:", d.ID, detailValueStyle),
+		field("URL:", d.URL, detailValueStyle.Hyperlink(d.URL)),
 	)
+
 	fileSection := sectionStyle.Render(fileInfoContent)
 
 	// --- 3. Progress Section ---
@@ -682,6 +723,9 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	}
 
 	progSection := lipgloss.NewStyle().Width(contentWidth).Render(progContent)
+	if d.done && d.err == nil {
+		progSection = ""
+	}
 
 	// --- 4. Stats Grid Section ---
 	var speedStr, etaStr, sizeStr, timeStr string
@@ -698,7 +742,7 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 
 	// Size
 	if d.done {
-		sizeStr = utils.FormatBytes(d.Total)
+		sizeStr = utils.FormatBytes(d.Downloaded)
 	} else {
 		sizeStr = fmt.Sprintf("%s / %s", utils.FormatBytes(d.Downloaded), utils.FormatBytes(d.Total))
 	}
@@ -723,20 +767,22 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	} else if d.rateLimited {
 		speedStr = "Rate limited, retrying..."
 		etaStr = "..."
-	} else if d.paused || d.Speed == 0 {
+	} else if d.phase == "verifying" || d.phase == "finalizing" {
+		speedStr = d.phase
+		etaStr = "--"
+	} else if d.paused {
 		speedStr = "Paused"
 		if d.RateLimitSet && d.RateLimit > 0 {
-			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimit(d.RateLimit))
-		} else if d.RateLimitSet {
-			speedStr += " (Limit: \u221E)"
+			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimitDisplay(d.RateLimit))
 		}
 		etaStr = "\u221e"
+	} else if d.Speed <= 0 {
+		speedStr = "Waiting for transfer"
+		etaStr = "--"
 	} else {
 		speedStr = utils.FormatSpeed(d.Speed)
 		if d.RateLimitSet && d.RateLimit > 0 {
-			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimit(d.RateLimit))
-		} else if d.RateLimitSet {
-			speedStr += " (Limit: \u221E)"
+			speedStr += fmt.Sprintf(" (Limit: %s)", utils.FormatRateLimitDisplay(d.RateLimit))
 		}
 		if d.Speed > 0 && d.Total > 0 && d.lastETA > 0 {
 			etaStr = formatDurationForUI(d.lastETA)
@@ -750,8 +796,8 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	// Stats Layout
 	colWidth := (contentWidth - (components.BorderFrameWidth * 2)) / 2
 	leftColItems := []string{
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Size:"), StatsValueStyle.Render(sizeStr)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Speed:"), StatsValueStyle.Render(speedStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Size:"), detailValueStyle.Render(sizeStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Speed:"), detailValueStyle.Render(speedStr)),
 	}
 	isActive := !d.done && !d.paused && !d.pausing && d.Speed > 0
 	if isActive {
@@ -760,12 +806,12 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 			conns = 1 // Single-connection download (range requests not supported)
 		}
 		connStr := fmt.Sprintf("%d", conns)
-		leftColItems = append(leftColItems, lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Conns:"), StatsValueStyle.Render(connStr)))
+		leftColItems = append(leftColItems, lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Conns:"), detailValueStyle.Render(connStr)))
 	}
 	leftCol := lipgloss.JoinVertical(lipgloss.Left, leftColItems...)
 	rightCol := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Time:"), StatsValueStyle.Render(timeStr)),
-		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("ETA:"), StatsValueStyle.Render(etaStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("Time:"), detailValueStyle.Render(timeStr)),
+		lipgloss.JoinHorizontal(lipgloss.Left, StatsLabelStyle.Width(7).Render("ETC:"), detailValueStyle.Render(etaStr)),
 	)
 
 	statsContent := lipgloss.JoinHorizontal(lipgloss.Top,
@@ -806,11 +852,12 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 	// Use explicit calls to insert divider only where needed
 	var parts []string
 
-	parts = append(parts, statusBox)
 	parts = append(parts, fileSection)
 	parts = append(parts, divider)
-	parts = append(parts, progSection)
-	parts = append(parts, divider)
+	if progSection != "" {
+		parts = append(parts, progSection)
+		parts = append(parts, divider)
+	}
 	parts = append(parts, statsSection)
 
 	if mirrorSection != "" {
@@ -831,11 +878,20 @@ func renderFocusedDetails(d *DownloadModel, w int, spinnerView string) string {
 }
 
 func getDownloadStatus(d *DownloadModel, spinnerView string) string {
+	// The spinner's own ANSI reset must not terminate the surrounding status
+	// color before the label is rendered.
+	spinnerView = ansi.Strip(spinnerView)
+	if d.moving {
+		return lipgloss.NewStyle().Foreground(colors.Cyan()).Render(spinnerView + " Moving")
+	}
 	if d.pausing {
 		return lipgloss.NewStyle().Foreground(colors.StatePaused()).Render(spinnerView + " Pausing...")
 	}
-	if d.resuming {
+	if d.resuming && d.started {
 		return lipgloss.NewStyle().Foreground(colors.StateDownloading()).Render(spinnerView + " Resuming...")
+	}
+	if d.done && d.err == nil && d.fileMissing {
+		return components.StatusMissing.Render()
 	}
 	status := components.DetermineStatus(d.done, d.paused, d.err != nil, d.started, d.resuming)
 	return status.RenderWithSpinner(spinnerView)
@@ -846,7 +902,7 @@ func (m RootModel) calcTotalSpeedBps() int64 {
 	total := int64(0)
 	for _, d := range m.downloads {
 		// Skip completed downloads
-		if d.done {
+		if d.done || d.paused || d.pausing || d.err != nil || d.phase == "verifying" || d.phase == "finalizing" {
 			continue
 		}
 		total += int64(d.Speed)
@@ -859,7 +915,7 @@ func (m RootModel) ComputeViewStats() ViewStats {
 	for _, d := range m.downloads {
 		if d.done {
 			stats.DownloadedCount++
-		} else if !d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.resuming) {
+		} else if !d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.started) {
 			stats.ActiveCount++
 		} else {
 			stats.QueuedCount++
@@ -871,11 +927,14 @@ func (m RootModel) ComputeViewStats() ViewStats {
 
 func (m RootModel) renderTabs(activeTab, activeCount, queuedCount, doneCount int) string {
 	tabs := []components.Tab{
+		{Label: "All", Count: activeCount + queuedCount + doneCount, Pinned: m.pinnedTab == TabAll},
 		{Label: "Queued", Count: queuedCount, Pinned: m.pinnedTab == TabQueued},
 		{Label: "Active", Count: activeCount, Pinned: m.pinnedTab == TabActive},
 		{Label: "Done", Count: doneCount, Pinned: m.pinnedTab == TabDone},
 	}
-	return components.RenderTabBar(tabs, activeTab, ActiveTabStyle, TabStyle)
+	// Keep the existing tab IDs and keybindings while displaying All first.
+	selected := (activeTab + 1) % dashboardTabCount
+	return components.RenderTabBar(tabs, selected, ActiveTabStyle, TabStyle)
 }
 
 func (m RootModel) viewQuitConfirm() string {

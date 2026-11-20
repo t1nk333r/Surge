@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	neturl "net/url"
 	"os"
@@ -51,14 +52,17 @@ type LifecycleManager struct {
 
 	// probeSem caps the number of simultaneous server probes so adding a
 	// large batch of downloads does not flood the network with HEAD requests.
-	probeSem     chan struct{}
-	shutdownOnce sync.Once
-	inflightMu   sync.Mutex
-	inflight     map[string]*inflightEnqueue
+	probeSem        chan struct{}
+	shutdownOnce    sync.Once
+	inflightMu      sync.Mutex
+	inflight        map[string]*inflightEnqueue
+	downloadLocksMu sync.Mutex
+	downloadLocks   map[string]*downloadLock
 	// Test hooks make concurrent enqueue tests deterministic without affecting
 	// production behavior.
-	inflightJoinHook  func()
-	inflightStartHook func()
+	inflightJoinHook    func()
+	inflightStartHook   func()
+	beforeQueuedPublish func()
 }
 
 type inflightEnqueue struct {
@@ -123,6 +127,7 @@ func NewLifecycleManager(pool *scheduler.Scheduler, eventBus *EventBus, settings
 	if settings == nil {
 		settings = config.DefaultSettings()
 	}
+	settings = settings.Clone()
 
 	var activeCheck IsNameActiveFunc
 	if len(isNameActive) > 0 {
@@ -143,18 +148,18 @@ func NewLifecycleManager(pool *scheduler.Scheduler, eventBus *EventBus, settings
 		aggregator = NewProgressAggregator(pool, eventBus, settings)
 	}
 
-	return &LifecycleManager{
-		settings:            settings,
-		settingsRefreshedAt: time.Now(),
-		pool:                pool,
-		eventBus:            eventBus,
-		aggregator:          aggregator,
-		isNameActive:        activeCheck,
-		probeSem:            sem,
-		inflight:            make(map[string]*inflightEnqueue),
-		mediaExtractor:      extractor.NewYtDlp(),
-		streamMuxer:         mux.NewFFmpeg(),
+	mgr := &LifecycleManager{
+		pool:           pool,
+		eventBus:       eventBus,
+		aggregator:     aggregator,
+		isNameActive:   activeCheck,
+		probeSem:       sem,
+		inflight:       make(map[string]*inflightEnqueue),
+		mediaExtractor: extractor.NewYtDlp(),
+		streamMuxer:    mux.NewFFmpeg(),
 	}
+	mgr.publishSettingsLocked(settings)
+	return mgr
 }
 
 // SetMediaExtractor replaces the media extractor. Passing nil disables
@@ -187,13 +192,12 @@ func (mgr *LifecycleManager) Shutdown() {
 	})
 }
 
+// GetSettings returns a snapshot that callers can read without holding the lock.
 func (m *LifecycleManager) GetSettings() *config.Settings {
 	m.settingsMu.RLock()
-	settings := m.settings
-	m.settingsMu.RUnlock()
-
-	if settings != nil {
-		return settings
+	defer m.settingsMu.RUnlock()
+	if m.settings != nil {
+		return m.settings.Clone()
 	}
 	return config.DefaultSettings()
 }
@@ -204,13 +208,35 @@ func (m *LifecycleManager) ApplySettings(s *config.Settings) {
 		return
 	}
 	m.settingsMu.Lock()
-	m.settings = s
-	m.settingsRefreshedAt = time.Now()
+	m.publishSettingsLocked(s.Clone())
 	m.settingsMu.Unlock()
+}
+
+// publishSettingsLocked updates the live snapshot and its global speed limit.
+// Callers hold settingsMu, except during construction before the manager is shared.
+func (m *LifecycleManager) publishSettingsLocked(next *config.Settings) {
+	var nextRate int64
+	var rateChanged bool
+	if m.pool != nil && next.Network.GlobalRateLimit != nil {
+		if rate, err := utils.ParseRateLimitValue(next.Network.GlobalRateLimit.Value); err == nil {
+			nextRate = rate
+			rateChanged = true
+			if m.settings != nil && m.settings.Network.GlobalRateLimit != nil {
+				previousRate, err := utils.ParseRateLimitValue(m.settings.Network.GlobalRateLimit.Value)
+				rateChanged = err != nil || previousRate != nextRate
+			}
+		}
+	}
+	m.settings = next
+	m.settingsRefreshedAt = time.Now()
+	if rateChanged {
+		m.pool.SetGlobalRateLimit(nextRate)
+	}
 }
 
 // DownloadRequest carries the already-approved inputs needed to probe and reserve a file path.
 type DownloadRequest struct {
+	Artifact           types.ArtifactPolicy
 	URL                string
 	Filename           string
 	Path               string
@@ -244,7 +270,7 @@ func (mgr *LifecycleManager) Enqueue(ctx context.Context, req *DownloadRequest) 
 		return "", "", types.ErrServiceUnavailable
 	}
 
-	utils.Debug("Lifecycle: Enqueue %s (Filename: %s)", req.URL, req.Filename)
+	utils.Debug("Lifecycle: Enqueue from host %s (Filename: %s)", utils.URLHostForLog(req.URL), req.Filename)
 	return mgr.enqueueResolved(ctx, req, "")
 }
 
@@ -254,11 +280,17 @@ func (mgr *LifecycleManager) EnqueueWithID(ctx context.Context, req *DownloadReq
 		return "", "", types.ErrServiceUnavailable
 	}
 
-	utils.Debug("Lifecycle: EnqueueWithID %s (%s)", req.URL, requestID)
+	utils.Debug("Lifecycle: EnqueueWithID from host %s (%s)", utils.URLHostForLog(req.URL), requestID)
 	return mgr.enqueueResolved(ctx, req, requestID)
 }
 
 func (mgr *LifecycleManager) enqueueResolved(ctx context.Context, req *DownloadRequest, requestID string) (string, string, error) {
+	copyRequest := *req
+	req = &copyRequest
+	if err := req.Artifact.Validate(); err != nil {
+		return "", "", err
+	}
+	req.Artifact = req.Artifact.Normalized()
 	if req.URL == "" {
 		return "", "", types.ErrURLRequired
 	}
@@ -310,6 +342,8 @@ func enqueueCoalescingKey(req *DownloadRequest) string {
 	writeString(req.URL)
 	writeString(req.Filename)
 	writeString(req.Path)
+	writeString(req.Artifact.OnExists)
+	writeString(req.Artifact.ExpectedSHA256)
 	fmt.Fprintf(&key, "%d:", len(req.Mirrors))
 	for _, mirror := range req.Mirrors {
 		writeString(mirror)
@@ -331,6 +365,10 @@ func enqueueCoalescingKey(req *DownloadRequest) string {
 }
 
 func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadRequest, requestID string) (string, string, error) {
+	if err := req.Artifact.Validate(); err != nil {
+		return "", "", err
+	}
+	req.Artifact = req.Artifact.Normalized()
 	settings := mgr.GetSettings()
 
 	// Throttle concurrent probes — acquire a semaphore slot before probing.
@@ -436,7 +474,7 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 			return "", "", fmt.Errorf("enqueue aborted: %w", ctx.Err())
 		}
 
-		finalPath, finalFilename, err := ResolveDestination(
+		finalPath, finalFilename, err := resolveDestinationWithPolicy(
 			req.URL,
 			req.Filename,
 			req.Path,
@@ -444,6 +482,7 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 			settings,
 			probeResult,
 			isNameActive,
+			req.Artifact.OnExists,
 		)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to resolve destination: %w", err)
@@ -468,6 +507,9 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 		// pick a different name instead of truncating this in-flight download.
 		if err := reserveWorkingFile(finalPath, finalFilename); err != nil {
 			if errors.Is(err, os.ErrExist) {
+				if req.Artifact.OnExists == "fail" {
+					return "", "", types.ErrDestinationExists
+				}
 				continue
 			}
 			return "", "", err
@@ -481,7 +523,7 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 			return "", "", err
 		}
 
-		queuedEvent := types.DownloadEvent{
+		queuedEvent := types.DownloadEvent{Artifact: cfg.Artifact,
 			Type:         types.EventQueued,
 			DownloadID:   cfg.ID,
 			Filename:     finalFilename,
@@ -493,34 +535,79 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 			Workers:      req.Workers,
 			MinChunkSize: req.MinChunkSize,
 		}
-		// Persist synchronously before publishing so the download survives a restart
-		// even if the event bus is full and Publish returns DeadlineExceeded.
-		// Doing this BEFORE pool.Add prevents EventStarted from racing with this
-		// persistence and corrupting the status to "queued" if it starts instantly.
-		if err := store.AddToMasterList(types.DownloadRecord{
-			ID:           queuedEvent.DownloadID,
-			URL:          queuedEvent.URL,
-			URLHash:      store.URLHash(queuedEvent.URL),
-			DestPath:     queuedEvent.DestPath,
-			Filename:     queuedEvent.Filename,
-			Mirrors:      append([]string(nil), queuedEvent.Mirrors...),
-			Status:       "queued",
-			RateLimit:    queuedEvent.RateLimit,
-			RateLimitSet: queuedEvent.RateLimitSet,
-			Workers:      queuedEvent.Workers,
-			MinChunkSize: queuedEvent.MinChunkSize,
-			SourceURL:    req.SourceURL,
-			FormatID:     req.FormatID,
-			Parts:        req.Parts,
-			ManifestURL:  req.ManifestURL,
-		}); err != nil {
-			utils.Debug("Lifecycle: Failed to persist queued download synchronously: %v", err)
+		// A removal of this download must follow its queued publication. This
+		// lock is per ID: event backpressure never holds the scheduler lock or
+		// prevents operations on other downloads. All paths below return.
+		unlock := mgr.lockDownload(cfg.ID)
+		defer unlock()
+
+		// Reject duplicates and shutdown before touching persistence or publishing.
+		// Persistence runs under the scheduler lock; the queued event is
+		// published only after AddWithPreparation returns so Publish
+		// backpressure cannot stall the lock, and EventStarted may arrive first.
+		accepted, err := mgr.pool.AddWithPreparation(*cfg, func() error {
+			if err := store.AddToMasterList(types.DownloadRecord{Artifact: cfg.Artifact,
+				ID:           queuedEvent.DownloadID,
+				URL:          queuedEvent.URL,
+				URLHash:      store.URLHash(queuedEvent.URL),
+				DestPath:     queuedEvent.DestPath,
+				Filename:     queuedEvent.Filename,
+				Mirrors:      append([]string(nil), queuedEvent.Mirrors...),
+				Status:       "queued",
+				RateLimit:    queuedEvent.RateLimit,
+				RateLimitSet: queuedEvent.RateLimitSet,
+				Workers:      queuedEvent.Workers,
+				MinChunkSize: queuedEvent.MinChunkSize,
+				SourceURL:    req.SourceURL,
+				FormatID:     req.FormatID,
+				Parts:        req.Parts,
+				ManifestURL:  req.ManifestURL,
+			}); err != nil {
+				utils.Debug("Lifecycle: Failed to persist queued download synchronously: %v", err)
+			}
+			// An extracted download's headers came from the extractor and are
+			// resolved again on resume, so they are never written to disk.
+			if len(cfg.Headers) > 0 && req.SourceURL == "" {
+				snapshot := &types.DownloadRecord{Artifact: cfg.Artifact,
+					ID:           cfg.ID,
+					URL:          cfg.URL,
+					DestPath:     queuedEvent.DestPath,
+					Filename:     cfg.Filename,
+					TotalSize:    cfg.TotalSize,
+					Status:       "queued",
+					Mirrors:      append([]string(nil), cfg.Mirrors...),
+					RateLimit:    cfg.RateLimit,
+					RateLimitSet: cfg.RateLimitSet,
+					Workers:      cfg.Workers,
+					MinChunkSize: cfg.MinChunkSize,
+					Headers:      maps.Clone(cfg.Headers),
+				}
+				if err := store.SaveStateWithOptions(cfg.URL, queuedEvent.DestPath, snapshot, store.SaveStateOptions{SkipFileHash: true}); err != nil {
+					if rollbackErr := store.DeleteState(cfg.ID); rollbackErr != nil {
+						utils.Debug("Lifecycle: Failed to roll back queued download after header persistence failure: %v", rollbackErr)
+					}
+					return fmt.Errorf("persist queued download headers: %w", err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			_ = os.Remove(surgePath)
+			return "", "", err
+		}
+		if !accepted {
+			_ = os.Remove(surgePath)
+			return "", "", types.ErrIDExists
 		}
 		if mgr.eventBus != nil {
+			if mgr.beforeQueuedPublish != nil {
+				mgr.beforeQueuedPublish()
+			}
 			_ = mgr.eventBus.Publish(queuedEvent)
+			if probeResult.Warning != "" {
+				_ = mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventSystem, DownloadID: cfg.ID, Message: probeResult.Warning})
+			}
 		}
-
-		mgr.pool.Add(*cfg)
 
 		return cfg.ID, finalFilename, nil
 	}
@@ -770,7 +857,7 @@ func (mgr *LifecycleManager) buildDownloadRecord(req *DownloadRequest, requestID
 		}
 	}
 
-	cfg := types.DownloadRecord{
+	cfg := types.DownloadRecord{Artifact: req.Artifact,
 		URL:                req.URL,
 		Mirrors:            req.Mirrors,
 		OutputPath:         finalPath,

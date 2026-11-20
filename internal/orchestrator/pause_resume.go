@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/SurgeDM/Surge/internal/config"
@@ -15,11 +16,23 @@ import (
 
 // Pause pauses an active download.
 func (mgr *LifecycleManager) Pause(id string) error {
+	if store.IsMoving(id) {
+		return types.ErrMoving
+	}
 	if mgr.pool == nil {
 		return types.ErrEngineNotInit
 	}
 
-	if mgr.pool.Pause(id) {
+	if result := mgr.pool.Pause(id); result.Found {
+		if result.QueuedConfig != nil && mgr.eventBus != nil {
+			_ = mgr.eventBus.Publish(types.DownloadEvent{
+				Type:         types.EventPaused,
+				DownloadID:   id,
+				Downloaded:   result.QueuedConfig.Downloaded,
+				RateLimit:    result.QueuedConfig.RateLimit,
+				RateLimitSet: result.QueuedConfig.RateLimitSet,
+			})
+		}
 		return nil
 	}
 
@@ -27,6 +40,9 @@ func (mgr *LifecycleManager) Pause(id string) error {
 	// synthesize a paused event so the UI can clear any transient "pausing" spinner.
 	entry, err := store.GetDownload(id)
 	if err == nil && entry != nil {
+		if entry.Status == "completed" || entry.Status == "paused" || entry.Status == "error" {
+			return nil // A stopped record must not be rewritten as a fresh pause.
+		}
 		if mgr.eventBus != nil {
 			_ = mgr.eventBus.Publish(types.DownloadEvent{
 				Type:         types.EventPaused,
@@ -62,6 +78,9 @@ func hydrateConfigFromDisk(cfg *types.DownloadRecord) {
 		cfg.Tasks = saved.Tasks
 		cfg.ChunkBitmap = saved.ChunkBitmap
 		cfg.ActualChunkSize = saved.ActualChunkSize
+	}
+	if len(cfg.Headers) == 0 && len(saved.Headers) > 0 {
+		cfg.Headers = maps.Clone(saved.Headers)
 	}
 	// The engine records finished streams in the store, so the persisted part
 	// list is more current than whatever the pool is still holding.
@@ -187,6 +206,9 @@ func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord
 // Hot path: download is still in pool memory (same session) - extract config directly.
 // Cold path: download was paused in a prior session, only stored in DB.
 func (mgr *LifecycleManager) Resume(id string) error {
+	if store.IsMoving(id) {
+		return types.ErrMoving
+	}
 	if mgr.pool == nil {
 		return types.ErrEngineNotInit
 	}
@@ -211,14 +233,19 @@ func (mgr *LifecycleManager) Resume(id string) error {
 			cfg.ProgressCh = mgr.eventBus.InputCh
 		}
 
-		mgr.pool.Add(*cfg)
-
-		if mgr.eventBus != nil {
-			_ = mgr.eventBus.Publish(types.DownloadEvent{
-				Type:       types.EventResumed,
-				DownloadID: id,
-				Filename:   cfg.Filename,
-			})
+		accepted, resumeErr := mgr.pool.AddWithBeforeStart(*cfg, func() error {
+			if mgr.eventBus != nil {
+				if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
+					utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+				}
+			}
+			return nil
+		})
+		if resumeErr != nil {
+			return resumeErr
+		}
+		if !accepted {
+			return types.ErrAlreadyActive
 		}
 		return nil
 	}
@@ -251,14 +278,19 @@ func (mgr *LifecycleManager) Resume(id string) error {
 	if mgr.eventBus != nil {
 		cfg.ProgressCh = mgr.eventBus.InputCh
 	}
-	mgr.pool.Add(cfg)
-
-	if mgr.eventBus != nil {
-		_ = mgr.eventBus.Publish(types.DownloadEvent{
-			Type:       types.EventResumed,
-			DownloadID: id,
-			Filename:   entry.Filename,
-		})
+	accepted, resumeErr := mgr.pool.AddWithBeforeStart(cfg, func() error {
+		if mgr.eventBus != nil {
+			if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: entry.Filename}); err != nil {
+				utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+			}
+		}
+		return nil
+	})
+	if resumeErr != nil {
+		return resumeErr
+	}
+	if !accepted {
+		return types.ErrAlreadyActive
 	}
 	return nil
 }
@@ -287,7 +319,19 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 	var coldIDs []string
 	coldIdx := make(map[string]int)
 
+	// Only the first occurrence of a duplicated ID goes through resume.
+	seen := make(map[string]struct{}, len(ids))
 	for i, id := range ids {
+		if store.IsMoving(id) {
+			errs[i] = types.ErrMoving
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			errs[i] = types.ErrAlreadyActive
+			continue
+		}
+		seen[id] = struct{}{}
+
 		if st := mgr.pool.GetStatus(id); st != nil {
 			switch st.Status {
 			case "pausing":
@@ -309,14 +353,21 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 				cfg.ProgressCh = mgr.eventBus.InputCh
 			}
 
-			mgr.pool.Add(*cfg)
-
-			if mgr.eventBus != nil {
-				_ = mgr.eventBus.Publish(types.DownloadEvent{
-					Type:       types.EventResumed,
-					DownloadID: id,
-					Filename:   cfg.Filename,
-				})
+			accepted, resumeErr := mgr.pool.AddWithBeforeStart(*cfg, func() error {
+				if mgr.eventBus != nil {
+					if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
+						utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+					}
+				}
+				return nil
+			})
+			if resumeErr != nil {
+				errs[i] = resumeErr
+				continue
+			}
+			if !accepted {
+				errs[i] = types.ErrAlreadyActive
+				continue
 			}
 			errs[i] = nil
 			continue
@@ -369,14 +420,21 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 			cfg.ProgressCh = mgr.eventBus.InputCh
 		}
 
-		mgr.pool.Add(cfg)
-
-		if mgr.eventBus != nil {
-			_ = mgr.eventBus.Publish(types.DownloadEvent{
-				Type:       types.EventResumed,
-				DownloadID: id,
-				Filename:   cfg.Filename,
-			})
+		accepted, resumeErr := mgr.pool.AddWithBeforeStart(cfg, func() error {
+			if mgr.eventBus != nil {
+				if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
+					utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+				}
+			}
+			return nil
+		})
+		if resumeErr != nil {
+			errs[idx] = resumeErr
+			continue
+		}
+		if !accepted {
+			errs[idx] = types.ErrAlreadyActive
+			continue
 		}
 		errs[idx] = nil
 	}
@@ -387,6 +445,12 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 // Cancel stops a download (both pool in-memory and DB) and emits a removal event.
 // The event worker handles file cleanup and DB removal via DownloadRemovedMsg.
 func (mgr *LifecycleManager) Cancel(id string) error {
+	unlock := mgr.lockDownload(id)
+	defer unlock()
+
+	if store.IsMoving(id) {
+		return types.ErrMoving
+	}
 	var filename, destPath string
 	var completed bool
 	var found bool
@@ -443,6 +507,9 @@ func (mgr *LifecycleManager) Cancel(id string) error {
 // list, the playlist URL and the page they came from all described the media
 // the user is replacing.
 func (mgr *LifecycleManager) UpdateURL(id string, newURL string) error {
+	if store.IsMoving(id) {
+		return types.ErrMoving
+	}
 	// Update in-memory state via pool (validates download state too)
 	if mgr.pool != nil {
 		if err := mgr.pool.UpdateURL(id, newURL); err != nil {
@@ -533,9 +600,11 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 	}
 
 	var mirrorURLs []string
+	var headers map[string]string
 	var dmState *progress.DownloadProgress
 
 	if savedState != nil {
+		headers = maps.Clone(savedState.Headers)
 		dmState = progress.New(id, savedState.TotalSize)
 		dmState.Bytes.Downloaded.Store(savedState.Downloaded)
 		dmState.Bytes.VerifiedProgress.Store(savedState.Downloaded)
@@ -571,7 +640,14 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		actualChunkSize = savedState.ActualChunkSize
 	}
 
-	return types.DownloadRecord{
+	var artifact types.ArtifactPolicy
+	if savedState != nil {
+		artifact = savedState.Artifact
+	}
+	if entry != nil && entry.Artifact != (types.ArtifactPolicy{}) {
+		artifact = entry.Artifact
+	}
+	return types.DownloadRecord{Artifact: artifact,
 		URL:             url,
 		OutputPath:      outputPath,
 		DestPath:        destPath,
@@ -587,6 +663,7 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		ProgressState:   dmState,
 		Runtime:         runtime,
 		Mirrors:         mirrorURLs,
+		Headers:         headers,
 		RateLimit:       rateLimit,
 		RateLimitSet:    rateLimitSet,
 		Tasks:           tasks,

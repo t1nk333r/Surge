@@ -6,8 +6,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-
 	"time"
+	"unicode"
 
 	"charm.land/lipgloss/v2"
 	"charm.land/lipgloss/v2/table"
@@ -43,6 +43,9 @@ Usage:
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 && args[0] == "help" {
+			return cmd.Help()
+		}
 		settings, err := config.LoadSettings()
 		if err != nil {
 			return fmt.Errorf("failed to load settings: %w", err)
@@ -50,10 +53,6 @@ Usage:
 
 		if len(args) > 0 && args[0] == "open" {
 			return openSettingsFile()
-		}
-
-		if len(args) > 0 && args[0] == "help" {
-			return cmd.Help()
 		}
 
 		isSetOperation := len(args) >= 2 && strings.Contains(args[0], ".")
@@ -168,6 +167,14 @@ func handleSetOperation(cmd *cobra.Command, settings *config.Settings, args []st
 	path := args[0]
 	value := args[1]
 
+	// LoadSettings resets an invalid bind_host to 0.0.0.0 in memory, and saving
+	// would persist it. Until bind_host is valid, only allow fixing bind_host.
+	if !strings.EqualFold(path, "network.bind_host") {
+		if _, err := config.LoadBindHost(); err != nil {
+			return fmt.Errorf("cannot save settings until network.bind_host can be read; repair the file with 'surge config open': %w", err)
+		}
+	}
+
 	if value == "default" {
 		if err := config.ResetSetting(settings, path); err != nil {
 			return err
@@ -211,8 +218,17 @@ func openSettingsFile() error {
 	var args []string
 
 	if editor := os.Getenv("EDITOR"); editor != "" {
-		command = editor
-		args = []string{path}
+		if _, err := exec.LookPath(editor); err == nil {
+			command = editor
+			args = []string{path}
+		} else {
+			parts, err := splitEditorCommand(editor)
+			if err != nil {
+				return fmt.Errorf("invalid EDITOR: %w", err)
+			}
+			command = parts[0]
+			args = append(parts[1:], path)
+		}
 	} else {
 		switch runtime.GOOS {
 		case "windows":
@@ -236,4 +252,56 @@ func openSettingsFile() error {
 		return fmt.Errorf("failed to open editor: %w", err)
 	}
 	return nil
+}
+
+// splitEditorCommand accepts an executable and arguments without invoking a shell.
+func splitEditorCommand(value string) ([]string, error) {
+	var parts []string
+	var current strings.Builder
+	var quote rune
+	started := false
+	runes := []rune(value)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r == '\\' && quote != '\'' && i+1 < len(runes) {
+			next := runes[i+1]
+			if next == '\\' || next == '"' || unicode.IsSpace(next) {
+				current.WriteRune(next)
+				i++
+				started = true
+				continue
+			}
+		}
+		if r == '\'' || r == '"' {
+			if quote == 0 {
+				quote = r
+				started = true
+				continue
+			}
+			if quote == r {
+				quote = 0
+				continue
+			}
+		}
+		if quote == 0 && unicode.IsSpace(r) {
+			if started {
+				parts = append(parts, current.String())
+				current.Reset()
+				started = false
+			}
+			continue
+		}
+		current.WriteRune(r)
+		started = true
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unclosed quote")
+	}
+	if started {
+		parts = append(parts, current.String())
+	}
+	if len(parts) == 0 || parts[0] == "" {
+		return nil, fmt.Errorf("missing editor command")
+	}
+	return parts, nil
 }

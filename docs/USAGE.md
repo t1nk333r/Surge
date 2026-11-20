@@ -24,7 +24,7 @@ While in the TUI Dashboard, you can rapidly add downloads using your clipboard:
 | Command                     | What it does                                                                           | Key flags                                                                                           | Notes                                                                   |
 | :-------------------------- | :------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------- |
 | `surge [url]...`            | Launches local TUI. Queues optional URLs.                                              | `--batch, -b`<br>`--port, -p`<br>`--output, -o`<br>`--no-resume`<br>`--exit-when-done`<br>`--no-server` | `-o` defaults to CWD. If `--host` is set, this becomes remote TUI mode. `--no-server` disables the embedded HTTP API for that session. |
-| `surge server [url]...`     | Launches headless server. Queues optional URLs.                                        | `--batch, -b`<br>`--port, -p`<br>`--bind`<br>`--output, -o`<br>`--exit-when-done`<br>`--no-resume`<br>`--token` | `--bind` defaults to `0.0.0.0`; use `127.0.0.1` for local-only access. |
+| `surge server [url]...`     | Launches headless server. Queues optional URLs.                                        | `--batch, -b`<br>`--port, -p`<br>`--bind`<br>`--output, -o`<br>`--exit-when-done`<br>`--no-resume`<br>`--token` | `--bind` overrides the `network.bind_host` setting (default `0.0.0.0`); use `127.0.0.1` for local-only access. |
 | `surge connect [host:port]` | Launches TUI connected to a server. Auto-detects local server when no target is given. | `--insecure-http`                                                                                   | Convenience alias for remote TUI usage.                                 |
 | `surge add <url>...`        | Queues downloads via CLI/API.                                                          | `--batch, -b`<br>`--output, -o`                                                                     | `-o` defaults to CWD. Alias: `get`.                                     |
 | `surge ls [id]`             | Lists downloads, or shows one download detail.                                         | `--json`<br>`--watch`<br>`--server-only`                                                          | Alias: `l`. `--server-only` requires a live server and disables the database fallback. |
@@ -35,21 +35,24 @@ While in the TUI Dashboard, you can rapidly add downloads using your clipboard:
 | `surge rm <id>`             | Removes a download by ID/prefix.                                                       | `--clean`, `--purge`                                                                                | Alias: `kill`.                                                          |
 | `surge config [path] [val]` | Get, set, or reset Surge configuration options via the CLI.                            | None                                                                                                | See [SETTINGS.md](SETTINGS.md) for available settings. Run without args to list all. |
 | `surge token`               | Prints current API auth token. (Also visible in TUI > Settings > Extension)            | None                                                                                                | Useful for remote clients.                                              |
-| `surge service <cmd>`       | Manages Surge as a system service (daemon).                                            | `install`, `uninstall`, `start`, `stop`, `status`, `token`                                      | Cross-platform (Linux/Windows/macOS). See [Service Management](#service-management). |
+| `surge service <cmd>`       | Manages Surge as the current user's background service.                                | `install`, `uninstall`, `start`, `stop`, `restart`, `status`                                    | Cross-platform. Never run with `sudo`; see [Service Management](#service-management). |
 | `surge bug-report`          | Opens a pre-filled GitHub bug report. Prompts for target (Core/Extension) and optional system/log details. | None                                                                                                | Prints a manual URL fallback if browser open fails.                     |
 
 ## Service Management
 
-The `service` command allows you to manage Surge as a background daemon that starts automatically on boot.
+The `service` command manages a background daemon that starts with the current
+user's login session and shares that user's normal settings, state, category
+paths, and token.
 
-- `surge service install`: Registers Surge as a system service.
-- `surge service uninstall`: Removes the system service.
+- `surge service install`: Registers and starts the user service.
+- `surge service uninstall`: Stops and removes the user service definition.
 - `surge service start`: Starts the background service.
 - `surge service stop`: Stops the background service.
-- `surge service status`: Checks if the service is installed and running.
-- `surge service token`: Prints the auth token used by the system service daemon.
+- `surge service restart`: Restarts the background service.
+- `surge service status`: Checks whether the user service is installed and running.
 
-**Note**: On most systems, these commands require administrative privileges (e.g., `sudo surge service install`).
+Run these commands as your normal user. `sudo surge service install` is rejected.
+Use `surge token` for both directly started and service-managed servers.
 
 ## Server Subcommands (Compatibility)
 

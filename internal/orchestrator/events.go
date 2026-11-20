@@ -14,9 +14,11 @@ import (
 )
 
 var (
-	renameCompletedFile = retryRename
-	copyCompletedFile   = utils.CopyFile
-	notify              = utils.Notify
+	renameArtifactNoReplace    = utils.RenameNoReplace
+	removeCompletedWorkingFile = retryRemove
+	renameCompletedFile        = retryRename
+	copyCompletedFile          = utils.CopyFile
+	notify                     = utils.Notify
 )
 
 // advanceRemainingTasks keeps saved chunk boundaries aligned when pause
@@ -99,7 +101,7 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 		case types.EventStarted:
 			// Persist the started record immediately so crash recovery and later lifecycle
 			// events have a stable destination record even before the first pause snapshot.
-			entry := types.DownloadRecord{
+			entry := types.DownloadRecord{Artifact: m.Artifact,
 				ID:           m.DownloadID,
 				URL:          m.URL,
 				URLHash:      store.URLHash(m.URL),
@@ -127,6 +129,11 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 			}
 
 		case types.EventPaused:
+			// Completion wins over a late pause acknowledgment, including the
+			// fallback emitted for a download no longer tracked by the pool.
+			if existing, _ := store.GetDownload(m.DownloadID); existing != nil && existing.Status == "completed" {
+				break
+			}
 			if m.State == nil {
 				existing, _ := store.GetDownload(m.DownloadID)
 				if existing == nil {
@@ -295,7 +302,7 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 					utils.Debug("Lifecycle: Failed to save pause state: %v", err)
 				}
 			} else {
-				utils.Debug("Lifecycle: Skipping SaveState for %s: destPath=%q url=%q", m.DownloadID, destPath, url)
+				utils.Debug("Lifecycle: Skipping SaveState for %s: destPath=%q host=%q", m.DownloadID, destPath, utils.URLHostForLog(url))
 			}
 
 		case types.EventComplete:
@@ -319,11 +326,16 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 				}
 			}
 
+			policy := m.Artifact
+			if existing != nil && existing.Artifact != (types.ArtifactPolicy{}) {
+				policy.OnExists = existing.Artifact.OnExists
+				policy.ExpectedSHA256 = existing.Artifact.ExpectedSHA256
+			}
 			// Completion only becomes durable once the working file is promoted, so a
 			// finalization failure must stay retryable instead of being recorded as done.
-			if err := finalizeCompletedFile(destPath); err != nil {
+			if err := finalizeArtifact(destPath, policy); err != nil {
 				utils.Debug("Lifecycle: Failed to finalize completed file at %s: %v", destPath, err)
-				errEntry := types.DownloadRecord{
+				errEntry := types.DownloadRecord{Artifact: policy, ErrorCode: artifactErrorCode(err),
 					ID:           m.DownloadID,
 					URL:          url,
 					URLHash:      urlHash,
@@ -358,7 +370,7 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 				break
 			}
 
-			entry := types.DownloadRecord{
+			entry := types.DownloadRecord{Artifact: policy,
 				ID:           m.DownloadID,
 				URL:          url,
 				URLHash:      urlHash,
@@ -377,8 +389,20 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 				entry.Workers = existing.Workers
 				entry.MinChunkSize = existing.MinChunkSize
 			}
-			if err := store.AddToMasterList(entry); err != nil {
+			if err := store.AddToMasterList(entry, func(moving bool) {
+				if mgr.eventBus != nil {
+					_ = mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventSystem, DownloadID: entry.ID, Moving: &moving})
+				}
+			}); err != nil {
 				utils.Debug("Lifecycle: Failed to persist completed download: %v", err)
+			}
+
+			if saved, err := store.GetDownload(m.DownloadID); err == nil && saved != nil && saved.CategoryOverride != nil && mgr.eventBus != nil {
+				event := types.DownloadEvent{Type: types.EventSystem, DownloadID: m.DownloadID, CategoryOverride: saved.CategoryOverride, DestPath: saved.DestPath}
+				if saved.CategoryMoveError != "" {
+					event.Message = "Category move failed; file kept at original location: " + saved.CategoryMoveError
+				}
+				_ = mgr.eventBus.Publish(event)
 			}
 			if err := store.DeleteTasks(m.DownloadID); err != nil {
 				utils.Debug("Lifecycle: Failed to delete completed tasks: %v", err)
@@ -402,6 +426,10 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 
 		case types.EventError:
 			existing, _ := store.GetDownload(m.DownloadID)
+			if existing != nil && m.Artifact != (types.ArtifactPolicy{}) {
+				existing.Artifact = m.Artifact
+			}
+
 			if m.State != nil {
 				// Pause-grade snapshot: persist detail state for breakpoint resume.
 				stateSnapshot := m.State
@@ -477,7 +505,7 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 					entryFilename = existing.Filename
 				}
 
-				entry := types.DownloadRecord{
+				entry := types.DownloadRecord{Artifact: m.Artifact, ErrorCode: artifactErrorCode(m.Err),
 					ID:           m.DownloadID,
 					URL:          url,
 					DestPath:     destPath,
@@ -510,13 +538,15 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 						utils.Debug("Lifecycle: Failed to persist error detail state: %v", err)
 					}
 				} else {
-					utils.Debug("Lifecycle: Skipping SaveState on error for %s: destPath=%q url=%q", m.DownloadID, destPath, url)
+					utils.Debug("Lifecycle: Skipping SaveState on error for %s: destPath=%q host=%q", m.DownloadID, destPath, utils.URLHostForLog(url))
 				}
 			} else {
 				if existing == nil {
 					existing = &types.DownloadRecord{ID: m.DownloadID}
 				}
 				existing.Status = "error"
+				existing.Downloaded = max(existing.Downloaded, m.Downloaded)
+				existing.ErrorCode = artifactErrorCode(m.Err)
 				if m.Err != nil {
 					existing.Error = m.Err.Error()
 				}
@@ -599,4 +629,38 @@ func (mgr *LifecycleManager) StartEventWorker(ch <-chan types.DownloadEvent) {
 			// file I/O churn without improving resume or history recovery.
 		}
 	}
+}
+
+func artifactErrorCode(err error) string {
+	if errors.Is(err, types.ErrIntegrityMismatch) {
+		return "integrity_mismatch"
+	}
+	if errors.Is(err, types.ErrDestinationExists) || errors.Is(err, os.ErrExist) {
+		return "destination_exists"
+	}
+	return ""
+}
+
+func finalizeArtifact(path string, policy types.ArtifactPolicy) error {
+	if policy.ExpectedSHA256 != "" && (policy.Verification != "verified" || policy.SHA256 != policy.ExpectedSHA256) {
+		return types.ErrIntegrityMismatch
+	}
+	if policy.OnExists == "" && policy.ExpectedSHA256 == "" {
+		return finalizeCompletedFile(path)
+	}
+	if path == "" {
+		return fmt.Errorf("missing artifact path")
+	}
+	if err := renameArtifactNoReplace(path+types.IncompleteSuffix, path); !errors.Is(err, errors.ErrUnsupported) {
+		return err
+	}
+	if err := os.Link(path+types.IncompleteSuffix, path); err != nil {
+		return err
+	}
+	// Linking publishes the artifact. Cleanup failure must not turn it back into
+	// retryable working data; RunDownload also rejects retained published links.
+	if err := removeCompletedWorkingFile(path + types.IncompleteSuffix); err != nil && !os.IsNotExist(err) {
+		utils.Debug("Lifecycle: Published artifact at %s; working-link cleanup failed: %v", path, err)
+	}
+	return nil
 }

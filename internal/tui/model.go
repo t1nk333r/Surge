@@ -3,6 +3,7 @@ package tui
 import (
 	"github.com/SurgeDM/Surge/internal/orchestrator"
 	engineprogress "github.com/SurgeDM/Surge/internal/progress"
+	"github.com/SurgeDM/Surge/internal/transferui"
 
 	"context"
 	"errors"
@@ -25,7 +26,7 @@ import (
 
 	"github.com/SurgeDM/Surge/internal/config"
 	"github.com/SurgeDM/Surge/internal/power"
-	"github.com/SurgeDM/Surge/internal/service"
+	downloadservice "github.com/SurgeDM/Surge/internal/service"
 	"github.com/SurgeDM/Surge/internal/tui/colors"
 	"github.com/SurgeDM/Surge/internal/tui/components"
 	"github.com/SurgeDM/Surge/internal/types"
@@ -65,8 +66,10 @@ const (
 	BugReportLogPathState
 	SpeedLimitsState
 	CategoryPickerState
+	CategoryMoveConfirmState
 	PurgeConfirmState
 	RemoveConfirmState
+	SettingsConfirmState
 )
 
 type FilePickerOrigin int
@@ -81,12 +84,16 @@ const (
 )
 
 const (
-	TabQueued = 0
-	TabActive = 1
-	TabDone   = 2
+	TabQueued         = 0
+	TabActive         = 1
+	TabDone           = 2
+	TabAll            = 3
+	dashboardTabCount = 4
 )
 
 type DownloadModel struct {
+	moving           bool
+	fileMissing      bool
 	ID               string
 	URL              string
 	Filename         string
@@ -112,6 +119,7 @@ type DownloadModel struct {
 	// No direct state access or polling reporter
 	state *engineprogress.DownloadProgress // Keep for now if needed for details view, but mostly passive
 
+	phase       string
 	done        bool
 	started     bool // Engine has confirmed start
 	err         error
@@ -122,20 +130,24 @@ type DownloadModel struct {
 }
 
 type RootModel struct {
-	downloads      []*DownloadModel
-	width          int
-	height         int
-	state          UIState
-	activeTab      int // 0=Queued, 1=Active, 2=Done
-	pinnedTab      int // -1=None, 0=Queued, 1=Active, 2=Done
-	inputs         []textinput.Model
-	focusedInput   int
-	hideMirrors    bool
-	purgeTargetID  string
-	removeTargetID string
+	lifecycleRevision uint64
+	resyncing         bool
+	resyncGeneration  uint64
+	resyncRetryDelay  time.Duration
+	downloads         []*DownloadModel
+	width             int
+	height            int
+	state             UIState
+	activeTab         int // TabQueued, TabActive, TabDone, or TabAll
+	pinnedTab         int // -1=None, otherwise a dashboard tab
+	inputs            []textinput.Model
+	focusedInput      int
+	hideMirrors       bool
+	purgeTargetID     string
+	removeTargetID    string
 	// Service Interface
 	// Core
-	Service      service.DownloadService
+	Service      downloadservice.DownloadService
 	Orchestrator *orchestrator.LifecycleManager
 
 	// File picker for directory selection
@@ -152,15 +164,17 @@ type RootModel struct {
 	PWD string
 
 	// Duplicate detection
-	pendingURL           string // URL pending confirmation
-	pendingPath          string // Path pending confirmation
-	pendingIsDefaultPath bool
-	pendingFilename      string   // Filename pending confirmation
-	pendingMirrors       []string // Mirrors pending confirmation
-	pendingHeaders       map[string]string
-	pendingWorkers       int    // Per-task worker override pending confirmation
-	pendingMinChunkSize  int64  // Per-task min chunk size override pending confirmation
-	duplicateInfo        string // Info about the duplicate
+	pendingDownloadID           string // Requested ID pending confirmation
+	pendingURL                  string // URL pending confirmation
+	pendingPath                 string // Path pending confirmation
+	pendingIsDefaultPath        bool
+	pendingFilename             string   // Filename pending confirmation
+	pendingMirrors              []string // Mirrors pending confirmation
+	pendingHeaders              map[string]string
+	pendingWorkers              int    // Per-task worker override pending confirmation
+	pendingMinChunkSize         int64  // Per-task min chunk size override pending confirmation
+	pendingSkipDuplicateWarning bool   // Request-specific duplicate warning override
+	duplicateInfo               string // Info about the duplicate
 
 	// Graph Data
 	SpeedHistory           []float64 // Stores the last ~60 ticks of speed data
@@ -172,19 +186,26 @@ type RootModel struct {
 	// Notification log system
 	logViewport viewport.Model // Scrollable log viewport
 	logEntries  []string       // Log entries for download events
+	logKinds    []logKind      // Semantic styles, applied using the current palette
 	logFocused  bool           // Whether the log viewport is focused
 
 	// Settings
-	Settings              *config.Settings // Application settings
+	Settings *config.Settings // Application settings
+	// SaveSettingsFunc owns persistence for this model. Local TUIs write the
+	// user config; remote TUIs replace this with a daemon-backed implementation.
+	// A nil function makes settings read-only and must never write defaults.
+	SaveSettingsFunc      func(*config.Settings) error
+	SettingsReadOnly      bool
 	SettingsBaseline      *config.Settings // Snapshot of settings when entering the settings view
 	StartupConfigWarnings []string         // Config validation warnings to emit on first render
-	SettingsActiveTab     int              // Active category tab (0-3)
+	SettingsActiveTab     int              // Active category tab
 	SettingsSelectedRow   int              // Selected setting within current tab
 	SettingsFocusedPane   int              // Focused settings pane (0 = Tabs, 1 = List)
 	SettingsIsEditing     bool             // Whether currently editing a value
 	SettingsInput         textinput.Model  // Input for editing string/int values
 	settingsError         string           // Current validation error in settings
-	ExtensionTokenCopied  bool             // Flash message for "Token Copied!"
+	settingsAction        *settingsAction
+	ExtensionTokenCopied  bool // Flash message for "Token Copied!"
 
 	// Speed Limits Modal
 	speedLimitsCursor    int
@@ -199,6 +220,14 @@ type RootModel struct {
 	searchInput  textinput.Model // Text input for search
 	searchActive bool            // Whether search mode is active
 	searchQuery  string          // Current search query
+
+	helpSearchInput  textinput.Model
+	helpSearchActive bool
+	helpSearchQuery  string
+
+	settingsSearchInput  textinput.Model
+	settingsSearchActive bool
+	settingsSearchQuery  string
 
 	// Batch import
 	pendingBatchURLs         []string // URLs pending batch import
@@ -215,6 +244,8 @@ type RootModel struct {
 	categoryPickerCursor int
 	categoryPickerAssign bool
 	categoryPickerTarget string
+	pendingCategory      string
+	AssignCategoryFunc   func(string, string, bool) error
 	catMgrEditField      int                // 0=Name, 1=Description, 2=Pattern, 3=Path
 	catMgrInputs         [4]textinput.Model // Inputs for Name, Description, Pattern, Path
 	catMgrIsNew          bool               // Whether adding a new category
@@ -264,6 +295,8 @@ type RootModel struct {
 func NewDownloadModel(id string, url string, filename string, total int64) *DownloadModel {
 	// Create dummy state container for compatibility if needed
 	state := engineprogress.New(id, total)
+	p := progress.New(progress.WithSpringOptions(0.5, 0.1))
+	applyProgressTheme(&p)
 	return &DownloadModel{
 		ID:            id,
 		URL:           url,
@@ -271,23 +304,18 @@ func NewDownloadModel(id string, url string, filename string, total int64) *Down
 		FilenameLower: strings.ToLower(filename),
 		Total:         total,
 		StartTime:     time.Now(),
-		progress: progress.New(
-			progress.WithSpringOptions(0.5, 0.1),
-			progress.WithColors(colors.Pink(), colors.Pink()),
-			progress.WithScaled(true),
-		),
-		state: state,
+		progress:      p,
+		state:         state,
 	}
 }
 
 // UpdateETA calculates the remaining time and applies EMA smoothing to prevent jitter.
 // This should be called once per progress update, NOT per render frame.
 func (d *DownloadModel) UpdateETA() {
-	if d.Total <= 0 || d.Speed <= 0 {
-		return // Do not clear lastETA to preserve EMA history when speed drops to 0 momentarily
+	if d.Total <= 0 || d.Speed <= 0 || !transferui.FiniteRate(d.Speed) {
+		d.lastETA = 0
+		return
 	}
-
-	remaining := d.Total - d.Downloaded
 
 	if !d.hasEtaSpeed {
 		d.etaSpeed = d.Speed
@@ -297,18 +325,29 @@ func (d *DownloadModel) UpdateETA() {
 		d.etaSpeed = etaAlpha*d.Speed + (1-etaAlpha)*d.etaSpeed
 	}
 
-	etaSeconds := float64(remaining) / d.etaSpeed
-
-	// Clamp ETA to 24 hours max to prevent bonkers values
-	const maxETASeconds = 24 * 60 * 60
-	if etaSeconds > maxETASeconds || etaSeconds < 0 {
-		return // Keep previous displayed ETA; etaSpeed itself is already updated above
+	eta, known := transferui.ETA(d.Total, d.Downloaded, d.etaSpeed)
+	if !known {
+		d.lastETA = 0
+		return
 	}
-
-	d.lastETA = time.Duration(etaSeconds * float64(time.Second))
+	d.lastETA = eta
 }
 
-func InitialRootModel(serverPort int, currentVersion string, service service.DownloadService, orchestrator *orchestrator.LifecycleManager, settings *config.Settings, noResume bool, currentCommit ...string) RootModel {
+func InitialRootModel(serverPort int, currentVersion string, service downloadservice.DownloadService, orchestrator *orchestrator.LifecycleManager, settings *config.Settings, noResume bool, currentCommit ...string) RootModel {
+	var statuses []types.DownloadStatus
+	if service != nil {
+		statuses, _ = service.List()
+	}
+	return initialRootModel(serverPort, currentVersion, service, orchestrator, settings, noResume, statuses, currentCommit...)
+}
+
+// InitialRootModelWithStatuses builds a model from statuses already fetched by
+// the caller. It avoids a second network request during remote TUI startup.
+func InitialRootModelWithStatuses(serverPort int, currentVersion string, service downloadservice.DownloadService, orchestrator *orchestrator.LifecycleManager, settings *config.Settings, noResume bool, statuses []types.DownloadStatus, currentCommit ...string) RootModel {
+	return initialRootModel(serverPort, currentVersion, service, orchestrator, settings, noResume, statuses, currentCommit...)
+}
+
+func initialRootModel(serverPort int, currentVersion string, service downloadservice.DownloadService, orchestrator *orchestrator.LifecycleManager, settings *config.Settings, noResume bool, statuses []types.DownloadStatus, currentCommit ...string) RootModel {
 	initialDarkBackground := true
 	if !IsTestMode {
 		initialDarkBackground = lipgloss.HasDarkBackground(os.Stdin, os.Stdout)
@@ -322,6 +361,8 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 
 	if settings == nil {
 		settings = config.DefaultSettings()
+	} else {
+		settings = settings.Clone()
 	}
 
 	urlInput := textinput.New()
@@ -390,76 +431,9 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 
 	applyColorModeForTheme(config.Resolve[int](settings.General.Theme), config.Resolve[string](settings.General.ThemePath), initialDarkBackground)
 
-	// Load paused downloads from master list (now uses global config directory)
-	var downloads []*DownloadModel
-	// Note: With Service abstraction, we might want to let the Service handle loading.
-	// But LocalDownloadService's List() calls store.ListAllDownloads().
-	// For TUI initialization, we should probably call Service.List() to populate the model.
-	// However, Service.List() returns []DownloadStatus, which we need to convert to []*DownloadModel.
-
-	// Let's use service.List() if available
-	if service != nil {
-		statuses, err := service.List()
-		if err == nil {
-			for _, s := range statuses {
-				dm := NewDownloadModel(s.ID, s.URL, s.Filename, s.TotalSize)
-				dm.Downloaded = s.Downloaded
-				if s.DestPath != "" {
-					dm.Destination = s.DestPath
-				} else {
-					dm.Destination = s.Filename // Fallback
-				}
-				// Status mapping
-				switch s.Status {
-				case "completed":
-					dm.done = true
-					dm.started = true
-					dm.progress.SetPercent(1.0)
-				case "error":
-					dm.done = true
-					dm.started = true
-					if s.Error != "" {
-						dm.err = errors.New(s.Error)
-					} else {
-						dm.err = errors.New("download failed")
-					}
-				case "pausing":
-					dm.pausing = true
-					dm.started = true
-				case "paused":
-					if config.Resolve[bool](settings.General.AutoResume) {
-						dm.resuming = true
-						dm.paused = true // Will update when resume event received
-					} else {
-						dm.paused = true
-					}
-					dm.started = true
-				case "queued":
-					// Always resume queued items
-					dm.resuming = true
-					dm.paused = true // Will update when resume event received
-					dm.started = false
-				case "downloading":
-					dm.started = true
-				}
-
-				if s.TotalSize > 0 {
-					dm.progress.SetPercent(s.Progress / 100.0)
-				}
-				if s.AvgSpeed > 0 {
-					dm.Speed = s.AvgSpeed
-				} else if s.Speed > 0 {
-					dm.Speed = s.Speed
-				}
-				if s.Status == "completed" && s.TimeTaken > 0 {
-					dm.Elapsed = time.Duration(s.TimeTaken) * time.Millisecond
-				}
-				dm.RateLimit = s.RateLimit
-				dm.RateLimitSet = s.RateLimitSet
-
-				downloads = append(downloads, dm)
-			}
-		}
+	downloads := make([]*DownloadModel, 0, len(statuses))
+	for _, status := range statuses {
+		downloads = append(downloads, downloadModelFromStatus(status, config.Resolve[bool](settings.General.AutoResume)))
 	}
 
 	// Initialize the download list
@@ -520,6 +494,7 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 
 	m := RootModel{
 		downloads:             downloads,
+		activeTab:             TabAll,
 		pinnedTab:             -1,
 		inputs:                []textinput.Model{urlInput, mirrorsInput, pathInput, filenameInput},
 		state:                 DashboardState,
@@ -530,6 +505,7 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 		Orchestrator:          orchestrator,
 		PWD:                   pwd,
 		Settings:              settings,
+		SaveSettingsFunc:      config.SaveSettings,
 		StartupConfigWarnings: startupConfigWarnings,
 		SettingsActiveTab:     0,
 		SettingsSelectedRow:   0,
@@ -540,6 +516,8 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 		logEntries:            make([]string, 0),
 		SettingsInput:         settingsInput,
 		searchInput:           searchInput,
+		helpSearchInput:       textinput.New(),
+		settingsSearchInput:   textinput.New(),
 		urlUpdateInput:        urlUpdateInput,
 		catMgrInputs:          [4]textinput.Model{catNameInput, catDescInput, catPatternInput, catPathInput},
 		keys:                  keys,
@@ -553,6 +531,10 @@ func InitialRootModel(serverPort int, currentVersion string, service service.Dow
 		cancelEnqueue:         cancelEnqueue,
 		powerController:       power.NewController(),
 		spinner:               s,
+	}
+
+	if store, ok := service.(downloadservice.SettingsService); ok {
+		m.SaveSettingsFunc = store.UpdateSettings
 	}
 
 	InitAuthToken() // Cache auth token for TUI to avoid per-frame disk I/O
@@ -656,14 +638,16 @@ func (m RootModel) getFilteredDownloads() []*DownloadModel {
 	for _, d := range m.downloads {
 		// Apply tab filter first
 		switch m.activeTab {
+		case TabAll:
+			// All states remain subject to the search and category filters below.
 		case TabQueued:
 			// Queued includes paused downloads and anything not currently active or done
-			if d.done || (!d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.resuming || d.started)) {
+			if d.done || (!d.paused && !d.pausing && (d.Speed > 0 || d.Connections > 0 || d.started)) {
 				continue
 			}
 		case TabActive:
 			// Active excludes paused downloads and anything without current activity
-			if d.done || d.paused || d.pausing || (d.Speed == 0 && d.Connections == 0 && !d.resuming && !d.started) {
+			if d.done || d.paused || d.pausing || (d.Speed == 0 && d.Connections == 0 && !d.started) {
 				continue
 			}
 		case TabDone:
@@ -800,21 +784,52 @@ func (m *RootModel) refreshThemeCaches() {
 	m.help.Styles.ShortDesc = lipgloss.NewStyle().Foreground(colors.LightGray())
 	m.help.Styles.FullKey = lipgloss.NewStyle().Foreground(colors.Pink())
 	m.help.Styles.FullDesc = lipgloss.NewStyle().Foreground(colors.LightGray())
+	m.help.Styles.ShortSeparator = lipgloss.NewStyle().Foreground(colors.Gray())
+	m.help.Styles.FullSeparator = lipgloss.NewStyle().Foreground(colors.Gray())
+	m.help.Styles.Ellipsis = lipgloss.NewStyle().Foreground(colors.Gray())
 	applyListTheme(&m.list)
 	applyFilepickerTheme(&m.filepicker)
+	for i := range m.inputs {
+		applyTextinputTheme(&m.inputs[i])
+	}
+	for _, input := range []*textinput.Model{&m.SettingsInput, &m.searchInput, &m.helpSearchInput, &m.settingsSearchInput, &m.urlUpdateInput} {
+		applyTextinputTheme(input)
+	}
+	for i := range m.catMgrInputs {
+		applyTextinputTheme(&m.catMgrInputs[i])
+	}
+	m.spinner.Style = lipgloss.NewStyle().Foreground(colors.Pink())
+	m.refreshLogViewportContent()
 	m.logoCache = ""
 	if m.graphRenderer != nil {
 		m.graphRenderer.InvalidateCache()
 	}
-	// Rebuild progress bar colors for all existing downloads so the solid pink color
-	// matches the newly loaded palette rather than the one active at creation time.
+	// Recolor existing bars without losing their animation or current percentage.
 	for _, d := range m.downloads {
-		d.progress = progress.New(
-			progress.WithSpringOptions(0.5, 0.1),
-			progress.WithColors(colors.Pink(), colors.Pink()),
-			progress.WithScaled(true),
-		)
+		applyProgressTheme(&d.progress)
 	}
+}
+
+func applyProgressTheme(p *progress.Model) {
+	// The default fill character is a half block. Two identical blend stops
+	// paint both its foreground and background, preserving a continuous bar.
+	progress.WithColors(colors.Pink())(p)
+	progress.WithColors(colors.Pink(), colors.Pink())(p)
+	progress.WithScaled(true)(p)
+	p.EmptyColor = colors.Gray()
+	p.PercentageStyle = lipgloss.NewStyle().Foreground(colors.Foreground())
+}
+
+func applyTextinputTheme(input *textinput.Model) {
+	styles := input.Styles()
+	for _, state := range []*textinput.StyleState{&styles.Focused, &styles.Blurred} {
+		state.Text = state.Text.Foreground(colors.Foreground())
+		state.Prompt = state.Prompt.Foreground(colors.Cyan())
+		state.Placeholder = state.Placeholder.Foreground(colors.LightGray())
+		state.Suggestion = state.Suggestion.Foreground(colors.LightGray())
+	}
+	styles.Cursor.Color = colors.Pink()
+	input.SetStyles(styles)
 }
 
 func applyFilepickerTheme(fp *filepicker.Model) {
@@ -823,6 +838,7 @@ func applyFilepickerTheme(fp *filepicker.Model) {
 	}
 
 	fp.Styles.Cursor = lipgloss.NewStyle().Foreground(colors.Pink())
+	fp.Styles.DisabledCursor = lipgloss.NewStyle().Foreground(colors.Gray())
 	fp.Styles.Symlink = lipgloss.NewStyle().Foreground(colors.Cyan())
 	fp.Styles.Directory = lipgloss.NewStyle().Foreground(colors.Blue())
 	fp.Styles.File = lipgloss.NewStyle().Foreground(colors.LightGray())
@@ -836,4 +852,72 @@ func applyFilepickerTheme(fp *filepicker.Model) {
 
 func (m RootModel) isResizing() bool {
 	return time.Since(m.lastResizeTime) < 200*time.Millisecond
+}
+
+// downloadModelFromStatus is shared by initial loading and event-loss recovery.
+func downloadModelFromStatus(s types.DownloadStatus, autoResume bool) *DownloadModel {
+	dm := NewDownloadModel(s.ID, s.URL, s.Filename, s.TotalSize)
+	dm.moving = s.Moving
+	dm.fileMissing = s.FileMissing
+	dm.categoryOverride = s.CategoryOverride
+	dm.phase = s.Phase
+	if s.Status == "verifying" || s.Status == "finalizing" {
+		dm.phase = s.Status
+		dm.started = true
+	}
+	dm.Downloaded = s.Downloaded
+	if s.DestPath != "" {
+		dm.Destination = s.DestPath
+	} else {
+		dm.Destination = s.Filename // Fallback
+	}
+	// Status mapping
+	switch s.Status {
+	case "completed":
+		dm.done = true
+		dm.started = true
+		dm.progress.SetPercent(1.0)
+	case "error":
+		dm.done = true
+		dm.started = true
+		if s.Error != "" {
+			dm.err = errors.New(s.Error)
+		} else {
+			dm.err = errors.New("download failed")
+		}
+	case "pausing":
+		dm.pausing = true
+		dm.started = true
+	case "paused":
+		if autoResume {
+			dm.resuming = true
+			dm.paused = true // Will update when resume event received
+		} else {
+			dm.paused = true
+		}
+		dm.started = true
+	case "queued":
+		// Always resume queued items
+		dm.resuming = true
+		dm.paused = true // Will update when resume event received
+		dm.started = false
+	case "downloading":
+		dm.started = true
+	}
+
+	if s.TotalSize > 0 {
+		dm.progress.SetPercent(s.Progress / 100.0)
+	}
+	if s.Status == "completed" && s.AvgSpeed > 0 {
+		dm.Speed = s.AvgSpeed
+	} else if s.Status == "downloading" && transferui.FiniteRate(s.Speed) {
+		dm.Speed = s.Speed
+	}
+	if s.Status == "completed" && s.TimeTaken > 0 {
+		dm.Elapsed = time.Duration(s.TimeTaken) * time.Millisecond
+	}
+	dm.RateLimit = s.RateLimit
+	dm.RateLimitSet = s.RateLimitSet
+
+	return dm
 }
