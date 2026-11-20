@@ -5,7 +5,7 @@ Documentation=https://github.com/SurgeDM/Surge
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/surge/desktop.env
-ExecStart=/usr/bin/env surge server --bind 127.0.0.1
+ExecStart=/usr/bin/env surge server start --managed-service --bind 127.0.0.1
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=30s

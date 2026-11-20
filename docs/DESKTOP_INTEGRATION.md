@@ -88,9 +88,11 @@ Useful management commands:
     systemctl --user disable --now surge.service
     journalctl --user -u surge.service -f
 
-The unit runs `surge server --bind 127.0.0.1`, starts at the user's default
-systemd target, restarts after crashes, and sends SIGTERM for Surge's existing
-clean shutdown path. Loopback binding keeps this automatically started API off
+The unit runs `surge server start --managed-service --bind 127.0.0.1`, starts
+at the user's default systemd target, restarts after crashes, and sends SIGTERM
+for Surge's existing clean shutdown path. `--managed-service` is how a server
+tells Surge it *is* the user service: without it, `surge server` sees
+`surge.service` active (its own unit) and refuses to start. Loopback binding keeps this automatically started API off
 the LAN; Bearer authentication is still required.
 
 ### Hardening
@@ -147,7 +149,7 @@ Add these lines, using the result of command -v surge:
 
     [Service]
     ExecStart=
-    ExecStart=/absolute/path/to/surge server --bind 127.0.0.1
+    ExecStart=/absolute/path/to/surge server start --managed-service --bind 127.0.0.1
 
 Then reload and restart:
 
