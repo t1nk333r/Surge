@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -175,6 +178,7 @@ func handleSetOperation(cmd *cobra.Command, settings *config.Settings, args []st
 		}
 	}
 
+	before, _ := json.Marshal(settings)
 	if value == "default" {
 		if err := config.ResetSetting(settings, path); err != nil {
 			return err
@@ -187,11 +191,49 @@ func handleSetOperation(cmd *cobra.Command, settings *config.Settings, args []st
 		cmd.Printf("Set %s to %s\n", path, value)
 	}
 
+	// An unchanged value is not written, and a running server is not asked to
+	// reload: callers that apply a setting on every start (the desktop widget)
+	// would otherwise rewrite the file and reload the server each time.
+	if after, err := json.Marshal(settings); err == nil && bytes.Equal(before, after) {
+		return nil
+	}
+
 	if err := config.SaveSettings(settings); err != nil {
 		return fmt.Errorf("failed to save settings: %w", err)
 	}
 
+	reloadRunningServerSettings(cmd)
 	return nil
+}
+
+// reloadRunningServerSettings asks a running local server to re-read the file
+// just saved. Without it the server keeps the settings it started with, keeps
+// using the old value, and its next settings save writes that old value back
+// over this edit. A remote --host server has a settings file of its own, so
+// only a local one is asked; no running server is not an error.
+func reloadRunningServerSettings(cmd *cobra.Command) {
+	if resolveHostTarget() != "" {
+		return
+	}
+	if _, ok := getActiveConnectionDetails(); !ok {
+		return
+	}
+	baseURL, token, err := resolveAPIConnection(false)
+	if err != nil || baseURL == "" {
+		cmd.PrintErrf("Saved, but the running server could not be reached to apply it; restart it to apply the change.\n")
+		return
+	}
+	resp, err := doAPIRequest(http.MethodPost, baseURL, token, "/settings/reload", nil)
+	if err != nil {
+		cmd.PrintErrf("Saved, but the running server did not reload its settings (%v); restart it to apply the change.\n", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		cmd.PrintErrf("Saved, but the running server did not reload its settings (HTTP %d); restart it to apply the change.\n", resp.StatusCode)
+		return
+	}
+	cmd.Println("Applied to the running server.")
 }
 
 func matchesSearch(catName, pathStr, desc string, terms []string) bool {
