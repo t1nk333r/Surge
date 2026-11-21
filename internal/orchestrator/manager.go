@@ -643,7 +643,7 @@ func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequ
 		case errors.Is(err, extractor.ErrPlaylist), errors.Is(err, extractor.ErrNoDirectFormat):
 			return false, fmt.Errorf("%s: %w", req.URL, err)
 		default:
-			utils.Debug("Lifecycle: %s could not resolve %s: %v", ex.Name(), req.URL, err)
+			utils.Debug("Lifecycle: %s could not resolve a page on %s: %v", ex.Name(), utils.URLHostForLog(req.URL), err)
 			return false, nil
 		}
 	}
@@ -651,7 +651,7 @@ func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequ
 		return false, nil
 	}
 
-	utils.Debug("Lifecycle: %s resolved %s to format %s (%d bytes)", ex.Name(), req.URL, media.FormatID, media.Size)
+	utils.Debug("Lifecycle: %s resolved a page on %s to format %s (%d bytes)", ex.Name(), utils.URLHostForLog(req.URL), media.FormatID, media.Size)
 
 	req.SourceURL = media.SourceURL
 	if req.SourceURL == "" {
@@ -727,7 +727,7 @@ func (mgr *LifecycleManager) adoptPlaylistURL(req *DownloadRequest, probeResult 
 	if req.Filename == "" {
 		req.Filename = playlistFilename(req.URL)
 	}
-	utils.Debug("Lifecycle: treating %s as a fragmented stream", req.URL)
+	utils.Debug("Lifecycle: treating a page on %s as a fragmented stream", utils.URLHostForLog(req.URL))
 	return nil
 }
 

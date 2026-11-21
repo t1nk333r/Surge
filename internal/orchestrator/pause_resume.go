@@ -16,6 +16,11 @@ import (
 
 // Pause pauses an active download.
 func (mgr *LifecycleManager) Pause(id string) error {
+	// Ordered against a resume in flight: an extracted download is re-resolved
+	// before admission, and a pause in that window would find nothing to pause.
+	unlock := mgr.lockDownload(id)
+	defer unlock()
+
 	if store.IsMoving(id) {
 		return types.ErrMoving
 	}
@@ -158,7 +163,7 @@ func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord
 
 	media, err := ex.Resolve(ctx, cfg.SourceURL, mgr.extractorOptions())
 	if err != nil || media == nil || media.URL == "" {
-		utils.Debug("Resume: %s could not re-resolve %s: %v", ex.Name(), cfg.SourceURL, err)
+		utils.Debug("Resume: %s could not re-resolve %s from %s: %v", ex.Name(), cfg.ID, utils.URLHostForLog(cfg.SourceURL), err)
 		return
 	}
 
@@ -198,7 +203,7 @@ func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord
 		return
 	}
 	cfg.URL = media.URL
-	utils.Debug("Resume: refreshed media URL for %s from %s", cfg.ID, cfg.SourceURL)
+	utils.Debug("Resume: refreshed media URL for %s from %s", cfg.ID, utils.URLHostForLog(cfg.SourceURL))
 }
 
 // Resume resumes a paused download.
@@ -206,6 +211,13 @@ func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord
 // Hot path: download is still in pool memory (same session) - extract config directly.
 // Cold path: download was paused in a prior session, only stored in DB.
 func (mgr *LifecycleManager) Resume(id string) error {
+	// Held from reading the paused config through admission: re-resolving an
+	// extracted URL can take seconds, and in that window the ID is in neither
+	// the queue nor the active set, so an unordered Cancel or Pause would be
+	// lost and the download revived.
+	unlock := mgr.lockDownload(id)
+	defer unlock()
+
 	if store.IsMoving(id) {
 		return types.ErrMoving
 	}
@@ -343,33 +355,8 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 			}
 		}
 
-		// Try hot path first
-		if cfg := mgr.pool.ExtractPausedConfig(id); cfg != nil {
-			hydrateConfigFromDisk(cfg)
-			mgr.refreshExtractedURLBefore(cfg, slotDeadline)
-			cfg.IsResume = true
-
-			if mgr.eventBus != nil {
-				cfg.ProgressCh = mgr.eventBus.InputCh
-			}
-
-			accepted, resumeErr := mgr.pool.AddWithBeforeStart(*cfg, func() error {
-				if mgr.eventBus != nil {
-					if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
-						utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
-					}
-				}
-				return nil
-			})
-			if resumeErr != nil {
-				errs[i] = resumeErr
-				continue
-			}
-			if !accepted {
-				errs[i] = types.ErrAlreadyActive
-				continue
-			}
-			errs[i] = nil
+		// Try hot path first, ordered against Cancel and Pause like Resume.
+		if mgr.resumeHot(id, slotDeadline, &errs[i]) {
 			continue
 		}
 
@@ -397,49 +384,53 @@ func (mgr *LifecycleManager) ResumeBatch(ids []string) []error {
 	for _, id := range coldIDs {
 		idx := coldIdx[id]
 		savedState := states[id]
-
-		var entry *types.DownloadRecord
-		if masterMap != nil {
-			entry = masterMap[id]
-		}
-
-		if savedState == nil && entry == nil {
-			errs[idx] = types.ErrNotFound
-			continue
-		}
-
-		if entry != nil && entry.Status == "completed" {
-			errs[idx] = types.ErrCompleted
-			continue
-		}
-
-		cfg := buildResumeConfig(id, outputPath, entry, savedState, settings)
-		mgr.refreshExtractedURLBefore(&cfg, slotDeadline)
-
-		if mgr.eventBus != nil {
-			cfg.ProgressCh = mgr.eventBus.InputCh
-		}
-
-		accepted, resumeErr := mgr.pool.AddWithBeforeStart(cfg, func() error {
-			if mgr.eventBus != nil {
-				if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
-					utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
-				}
-			}
-			return nil
-		})
-		if resumeErr != nil {
-			errs[idx] = resumeErr
-			continue
-		}
-		if !accepted {
-			errs[idx] = types.ErrAlreadyActive
-			continue
-		}
-		errs[idx] = nil
+		errs[idx] = mgr.resumeCold(id, outputPath, masterMap, savedState, settings, slotDeadline)
 	}
 
 	return errs
+}
+
+// resumeCold resumes one batch item known only to the store, ordered against
+// Cancel and Pause like Resume.
+func (mgr *LifecycleManager) resumeCold(id, outputPath string, masterMap map[string]*types.DownloadRecord, savedState *types.DownloadRecord, settings *config.Settings, slotDeadline time.Time) error {
+	unlock := mgr.lockDownload(id)
+	defer unlock()
+
+	var entry *types.DownloadRecord
+	if masterMap != nil {
+		entry = masterMap[id]
+	}
+
+	if savedState == nil && entry == nil {
+		return types.ErrNotFound
+	}
+
+	if entry != nil && entry.Status == "completed" {
+		return types.ErrCompleted
+	}
+
+	cfg := buildResumeConfig(id, outputPath, entry, savedState, settings)
+	mgr.refreshExtractedURLBefore(&cfg, slotDeadline)
+
+	if mgr.eventBus != nil {
+		cfg.ProgressCh = mgr.eventBus.InputCh
+	}
+
+	accepted, resumeErr := mgr.pool.AddWithBeforeStart(cfg, func() error {
+		if mgr.eventBus != nil {
+			if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
+				utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+			}
+		}
+		return nil
+	})
+	if resumeErr != nil {
+		return resumeErr
+	}
+	if !accepted {
+		return types.ErrAlreadyActive
+	}
+	return nil
 }
 
 // Cancel stops a download (both pool in-memory and DB) and emits a removal event.
@@ -670,4 +661,41 @@ func buildResumeConfig(id, outputPath string, entry *types.DownloadRecord, saved
 		ChunkBitmap:     chunkBitmap,
 		ActualChunkSize: actualChunkSize,
 	}
+}
+
+// resumeHot resumes one batch item the pool still holds paused, reporting
+// whether it was one; its outcome is written to *errOut.
+func (mgr *LifecycleManager) resumeHot(id string, slotDeadline time.Time, errOut *error) bool {
+	unlock := mgr.lockDownload(id)
+	defer unlock()
+
+	cfg := mgr.pool.ExtractPausedConfig(id)
+	if cfg == nil {
+		return false
+	}
+	hydrateConfigFromDisk(cfg)
+	mgr.refreshExtractedURLBefore(cfg, slotDeadline)
+	cfg.IsResume = true
+
+	if mgr.eventBus != nil {
+		cfg.ProgressCh = mgr.eventBus.InputCh
+	}
+
+	accepted, resumeErr := mgr.pool.AddWithBeforeStart(*cfg, func() error {
+		if mgr.eventBus != nil {
+			if err := mgr.eventBus.Publish(types.DownloadEvent{Type: types.EventResumed, DownloadID: id, Filename: cfg.Filename}); err != nil {
+				utils.Debug("Lifecycle: Failed to publish resumed event for %s: %v", id, err)
+			}
+		}
+		return nil
+	})
+	switch {
+	case resumeErr != nil:
+		*errOut = resumeErr
+	case !accepted:
+		*errOut = types.ErrAlreadyActive
+	default:
+		*errOut = nil
+	}
+	return true
 }
