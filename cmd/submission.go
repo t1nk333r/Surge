@@ -48,7 +48,15 @@ func readSubmissionReceipt(resp *http.Response) (submissionItem, error) {
 			return submissionItem{Status: "unknown"}, uncertainSubmission()
 		}
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity {
-			return submissionItem{Status: "failed"}, clioutput.NewError(clioutput.InvalidArguments, "The server rejected the download input.", cause)
+			message := "The server rejected the download input."
+			// Only a 422 body is a fixed refusal reason (a playlist, a missing
+			// ffmpeg); other error bodies can echo the submitted URL.
+			if resp.StatusCode == http.StatusUnprocessableEntity {
+				if reason := submissionRefusalReason(resp.Body); reason != "" {
+					message = "The server rejected the download input: " + reason
+				}
+			}
+			return submissionItem{Status: "failed"}, clioutput.NewError(clioutput.InvalidArguments, message, cause)
 		}
 		return submissionItem{Status: "failed"}, remoteStatusError(resp.StatusCode, cause)
 	}
@@ -65,6 +73,15 @@ func readSubmissionReceipt(resp *http.Response) (submissionItem, error) {
 		return submissionItem{Status: "pending_approval", RequestID: receipt.ID}, nil
 	}
 	return submissionItem{Status: "queued", ID: receipt.ID}, nil
+}
+
+// submissionRefusalReason is the first line of a refusal body, bounded and
+// made terminal-safe, so a refused page (a playlist, a missing ffmpeg) says why.
+func submissionRefusalReason(body io.Reader) string {
+	const maxReasonBytes = 512
+	data, _ := io.ReadAll(io.LimitReader(body, maxReasonBytes))
+	line, _, _ := strings.Cut(string(data), "\n")
+	return safeTerminalText(strings.TrimSpace(line))
 }
 
 func uncertainSubmission() error {

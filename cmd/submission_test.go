@@ -3,8 +3,11 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/SurgeDM/Surge/internal/clioutput"
+	"github.com/SurgeDM/Surge/internal/extractor"
 	"github.com/SurgeDM/Surge/internal/testutil"
 )
 
@@ -208,4 +212,26 @@ func TestAddRequiresInputAndHonorsOutputFailures(t *testing.T) {
 			t.Fatalf("exit=%d writes=%d", code, out.calls)
 		}
 	})
+}
+
+// A media page the server refuses outright (a playlist, a missing ffmpeg) is a
+// definite failure that says why, not an uncertain "may have been accepted".
+func TestReadSubmissionReceiptReportsMediaRefusal(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	reason := mediaRefusalReason(fmt.Errorf("https://user:secret@site.example/list: %w", extractor.ErrPlaylist))
+	if reason == "" || strings.Contains(reason, "secret") {
+		t.Fatalf("refusal reason = %q", reason)
+	}
+	http.Error(recorder, reason, http.StatusUnprocessableEntity)
+
+	item, err := readSubmissionReceipt(recorder.Result())
+	if item.Status != "failed" || err == nil {
+		t.Fatalf("item=%+v err=%v", item, err)
+	}
+	if !strings.Contains(clioutput.Describe(err).Message, extractor.ErrPlaylist.Error()) {
+		t.Fatalf("refusal reason missing from %q", clioutput.Describe(err).Message)
+	}
+	if mediaRefusalReason(errors.New("disk full")) != "" {
+		t.Fatal("an ordinary error was treated as a media refusal")
+	}
 }

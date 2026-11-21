@@ -50,6 +50,10 @@ func newListCommand() *cobra.Command {
 
 			baseURL, token, err := resolveAPIConnection(serverOnly)
 			if err != nil {
+				if serverOnly && baseURL == "" && resolveHostTarget() == "" {
+					// The desktop widget matches "not running locally".
+					return clioutput.NewError(clioutput.Unavailable, "Surge is not running locally. Start it or pass --host (or set SURGE_HOST).", err)
+				}
 				return err
 			}
 

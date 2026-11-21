@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 
 	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/extractor"
+	"github.com/SurgeDM/Surge/internal/mux"
 	"github.com/SurgeDM/Surge/internal/orchestrator"
 	"github.com/SurgeDM/Surge/internal/service"
 	"github.com/SurgeDM/Surge/internal/types"
@@ -117,6 +119,13 @@ func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir str
 	if err != nil {
 		recordPreflightDownloadError(resolved.urlForAdd, resolved.outPath, err)
 		publishSystemLog(fmt.Sprintf("Error adding download from %s: %v", utils.URLHostForLog(resolved.urlForAdd), err))
+		if reason := mediaRefusalReason(err); reason != "" {
+			// A definite refusal: answering 5xx would tell the client the
+			// download may have been queued. The body is a fixed reason, not
+			// err, which carries the submitted URL and its credentials.
+			http.Error(w, reason, http.StatusUnprocessableEntity)
+			return
+		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, types.ErrDestinationExists) {
 			status = http.StatusConflict
@@ -709,4 +718,18 @@ func mapClientWindowsPath(reqPath string, relativeToDefaultDir bool, defaultOutp
 
 func shouldFallbackUnmappedWindowsPath(relativeToDefaultDir bool, hostOS string) bool {
 	return relativeToDefaultDir || hostOS != "windows"
+}
+
+// mediaRefusalReason describes the media pipeline refusing a page it
+// recognised but cannot deliver as one file, or returns "" for any other error.
+func mediaRefusalReason(err error) string {
+	switch {
+	case errors.Is(err, extractor.ErrPlaylist):
+		return extractor.ErrPlaylist.Error()
+	case errors.Is(err, extractor.ErrNoDirectFormat):
+		return extractor.ErrNoDirectFormat.Error()
+	case errors.Is(err, mux.ErrNotAvailable):
+		return "this page needs ffmpeg to join its streams; install ffmpeg"
+	}
+	return ""
 }
