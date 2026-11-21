@@ -84,6 +84,25 @@ func persistedHeaders(state *types.DownloadRecord) map[string]string {
 	return maps.Clone(state.Headers)
 }
 
+// isExtractedDownload reports whether state belongs to a download whose URL
+// came from a media extractor: the record says so itself, its master entry
+// does, or it is one stream of a multi-part download ("<id>#p<index>"). list
+// may be nil when the master list could not be read.
+func isExtractedDownload(state *types.DownloadRecord, list *types.MasterList) bool {
+	if state.SourceURL != "" || strings.Contains(state.ID, "#p") {
+		return true
+	}
+	if list == nil {
+		return false
+	}
+	for _, e := range list.Downloads {
+		if e.ID == state.ID {
+			return e.SourceURL != ""
+		}
+	}
+	return false
+}
+
 // persistedParts copies a stream list without its transient per-part headers,
 // which encoding/gob would otherwise write despite their struct tag.
 func persistedParts(parts []types.DownloadPart) []types.DownloadPart {
@@ -240,11 +259,6 @@ func SaveStateWithOptions(url string, destPath string, state *types.DownloadReco
 		state.Tasks = []types.Task{}
 	}
 
-	ds := DetailState{
-		Version: 2,
-		State:   toPersistedDetail(state),
-	}
-
 	if err := ensureDirs(); err != nil {
 		return err
 	}
@@ -268,14 +282,26 @@ func SaveStateWithOptions(url string, destPath string, state *types.DownloadReco
 	if err != nil {
 		return err
 	}
+
+	// The engine's pause snapshots carry the request headers but not the
+	// extraction identity, so whether this is an extracted download is decided
+	// by the master entry, not by the record being saved.
+	list, listErr := loadMasterListUnlocked()
+	record := toPersistedDetail(state)
+	if isExtractedDownload(state, list) {
+		record.Headers = nil
+	}
+	ds := DetailState{
+		Version: 2,
+		State:   record,
+	}
 	if err := atomicWrite(detailPath, ds); err != nil {
 		return fmt.Errorf("failed to write detail state: %w", err)
 	}
 
 	// Update the lightweight index (MasterList)
-	list, err := loadMasterListUnlocked()
-	if err != nil {
-		return fmt.Errorf("failed to load master list: %w", err)
+	if listErr != nil {
+		return fmt.Errorf("failed to load master list: %w", listErr)
 	}
 	found := false
 	for i, e := range list.Downloads {
@@ -844,6 +870,11 @@ func ReplaceURL(id string, newURL string) error {
 		}
 		var ds DetailState
 		if err := loadGob(detailPath, &ds); err == nil && ds.State != nil {
+			// Headers saved under an extraction were resolved for the old
+			// media and must not be sent to the URL the user chose instead.
+			if ds.State.SourceURL != "" {
+				ds.State.Headers = nil
+			}
 			ds.State.URL = newURL
 			ds.State.URLHash = URLHash(newURL)
 			ds.State.SourceURL = ""

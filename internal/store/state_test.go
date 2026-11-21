@@ -2150,3 +2150,89 @@ func TestCategoryCopyDiscardsDestinationIfRecordChanged(t *testing.T) {
 		t.Fatal("reservation leaked after conflict")
 	}
 }
+
+// The engine's pause snapshot carries the request headers but none of the
+// extraction identity. For an extracted download those headers came from the
+// extractor and can carry credentials, so the store must decide by the master
+// entry and keep them off disk; an ordinary download keeps its headers for an
+// authenticated resume.
+func TestSaveStateKeepsExtractedHeadersOffDisk(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	secret := map[string]string{"Cookie": "session=SECRET"}
+	cases := []struct {
+		name        string
+		id          string
+		sourceURL   string
+		wantHeaders bool
+	}{
+		{name: "extracted", id: uuid.New().String(), sourceURL: "https://site.example/watch"},
+		{name: "part stream", id: uuid.New().String() + "#p0"},
+		{name: "ordinary", id: uuid.New().String(), wantHeaders: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "https://cdn.example/" + tc.name
+			dest := filepath.Join(tempDir, tc.name+".bin")
+			if err := AddToMasterList(types.DownloadRecord{
+				ID: tc.id, URL: url, DestPath: dest, Status: "downloading", SourceURL: tc.sourceURL,
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			// What the concurrent downloader's pause snapshot writes.
+			snapshot := &types.DownloadRecord{ID: tc.id, URL: url, DestPath: dest, Headers: secret}
+			if err := SaveStateWithOptions(url, dest, snapshot, SaveStateOptions{SkipFileHash: true}); err != nil {
+				t.Fatalf("save: %v", err)
+			}
+			got, err := LoadState(url, dest)
+			if err != nil || got == nil {
+				t.Fatalf("load: %v", err)
+			}
+			if tc.wantHeaders != (len(got.Headers) > 0) {
+				t.Errorf("headers on disk = %v, want present=%v", got.Headers, tc.wantHeaders)
+			}
+		})
+	}
+}
+
+// ReplaceURL ends the extraction, and with it the headers resolved for the
+// old media: they must not be replayed to the URL the user chose instead.
+func TestReplaceURLDropsExtractedHeaders(t *testing.T) {
+	tempDir := setupTestDB(t)
+	defer os.RemoveAll(tempDir)
+
+	id := uuid.New().String()
+	url := "https://cdn.example/old"
+	dest := filepath.Join(tempDir, "clip.mp4")
+	if err := AddToMasterList(types.DownloadRecord{ID: id, URL: url, DestPath: dest, Status: "paused"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// A detail file written before headers were kept off disk.
+	if err := SaveStateWithOptions(url, dest, &types.DownloadRecord{
+		ID: id, URL: url, DestPath: dest, SourceURL: "https://site.example/watch",
+		Headers: map[string]string{"Cookie": "session=SECRET"},
+	}, SaveStateOptions{SkipFileHash: true}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	detailPath := mustDetailPath(t, tempDir, id)
+	var ds DetailState
+	if err := loadGob(detailPath, &ds); err != nil {
+		t.Fatalf("read detail: %v", err)
+	}
+	ds.State.Headers = map[string]string{"Cookie": "session=SECRET"}
+	if err := atomicWrite(detailPath, ds); err != nil {
+		t.Fatalf("plant legacy headers: %v", err)
+	}
+
+	if err := ReplaceURL(id, "https://other.example/file.mp4"); err != nil {
+		t.Fatalf("ReplaceURL: %v", err)
+	}
+	got, err := LoadState("https://other.example/file.mp4", dest)
+	if err != nil || got == nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got.Headers) > 0 {
+		t.Errorf("headers survived ReplaceURL: %v", got.Headers)
+	}
+}
