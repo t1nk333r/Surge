@@ -16,6 +16,7 @@ import (
 
 	"github.com/SurgeDM/Surge/internal/clioutput"
 	"github.com/SurgeDM/Surge/internal/extractor"
+	"github.com/SurgeDM/Surge/internal/orchestrator"
 	"github.com/SurgeDM/Surge/internal/testutil"
 )
 
@@ -230,6 +231,9 @@ func TestReadSubmissionReceiptReportsMediaRefusal(t *testing.T) {
 	}
 	if !strings.Contains(clioutput.Describe(err).Message, extractor.ErrPlaylist.Error()) {
 		t.Fatalf("refusal reason missing from %q", clioutput.Describe(err).Message)
+	}
+	if mediaRefusalReason(fmt.Errorf("https://site.example/watch: %w", orchestrator.ErrChecksumNeedsSingleFile)) == "" {
+		t.Fatal("a checksum on assembled media was not treated as a refusal")
 	}
 	if mediaRefusalReason(errors.New("disk full")) != "" {
 		t.Fatal("an ordinary error was treated as a media refusal")

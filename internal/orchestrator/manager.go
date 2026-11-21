@@ -615,6 +615,11 @@ func (mgr *LifecycleManager) enqueueNew(ctx context.Context, req *DownloadReques
 	return "", "", fmt.Errorf("failed to reserve unique working file for %q after %d attempts", req.URL, maxWorkingFileReservationAttempts)
 }
 
+// ErrChecksumNeedsSingleFile refuses an expected SHA-256 for media that is
+// assembled from separate streams or fragments rather than downloaded as one
+// file.
+var ErrChecksumNeedsSingleFile = errors.New("a SHA-256 can only be verified for a single-file download; this page is assembled from separate streams")
+
 // extractMedia rewrites req in place when the URL is a media page the
 // extractor can resolve to a single downloadable file. It reports whether the
 // request was rewritten.
@@ -658,6 +663,11 @@ func (mgr *LifecycleManager) extractMedia(ctx context.Context, req *DownloadRequ
 		req.SourceURL = req.URL
 	}
 	req.FormatID = media.FormatID
+	// Separate streams and fragments are assembled into a new container by
+	// ffmpeg, so no published digest can match the file Surge delivers.
+	if req.Artifact.ExpectedSHA256 != "" && (media.ManifestURL != "" || len(media.Parts) > 0) {
+		return false, fmt.Errorf("%s: %w", req.URL, ErrChecksumNeedsSingleFile)
+	}
 	switch {
 	case media.ManifestURL != "":
 		// A fragmented stream is assembled with ffmpeg after the fragments

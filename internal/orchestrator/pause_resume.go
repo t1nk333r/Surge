@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/extractor"
 	"github.com/SurgeDM/Surge/internal/progress"
 	"github.com/SurgeDM/Surge/internal/store"
 	"github.com/SurgeDM/Surge/internal/types"
@@ -161,13 +162,23 @@ func (mgr *LifecycleManager) refreshExtractedURLBefore(cfg *types.DownloadRecord
 	ctx, cancel := context.WithTimeout(context.Background(), resumeRefreshTimeout)
 	defer cancel()
 
-	media, err := ex.Resolve(ctx, cfg.SourceURL, mgr.extractorOptions())
+	// One settings snapshot for both legs: a URL resolved through one proxy is
+	// signed for that route, so the download must take the same one even if
+	// the proxy changed while this download was paused.
+	live := mgr.GetSettings().ToRuntimeConfig()
+	media, err := ex.Resolve(ctx, cfg.SourceURL, extractor.Options{ProxyURL: live.ProxyURL})
 	if err != nil || media == nil || media.URL == "" {
 		utils.Debug("Resume: %s could not re-resolve %s from %s: %v", ex.Name(), cfg.ID, utils.URLHostForLog(cfg.SourceURL), err)
 		return
 	}
 
 	cfg.FormatID = media.FormatID
+	if cfg.Runtime != nil {
+		runtime := *cfg.Runtime
+		runtime.ProxyURL = live.ProxyURL
+		runtime.CustomDNS = live.CustomDNS
+		cfg.Runtime = &runtime
+	}
 
 	if len(media.Parts) > 0 {
 		// Multi-part media keeps the page URL as its identity, so nothing has

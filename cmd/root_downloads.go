@@ -721,7 +721,7 @@ func shouldFallbackUnmappedWindowsPath(relativeToDefaultDir bool, hostOS string)
 }
 
 // mediaRefusalReason describes the media pipeline refusing a page it
-// recognised but cannot deliver as one file, or returns "" for any other error.
+// recognised but cannot deliver as asked, or returns "" for any other error.
 func mediaRefusalReason(err error) string {
 	switch {
 	case errors.Is(err, extractor.ErrPlaylist):
@@ -730,6 +730,8 @@ func mediaRefusalReason(err error) string {
 		return extractor.ErrNoDirectFormat.Error()
 	case errors.Is(err, mux.ErrNotAvailable):
 		return "this page needs ffmpeg to join its streams; install ffmpeg"
+	case errors.Is(err, orchestrator.ErrChecksumNeedsSingleFile):
+		return orchestrator.ErrChecksumNeedsSingleFile.Error()
 	}
 	return ""
 }

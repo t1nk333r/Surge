@@ -24,7 +24,7 @@ While in the TUI Dashboard, you can rapidly add downloads using your clipboard:
 | Command                     | What it does                                                                           | Key flags                                                                                           | Notes                                                                   |
 | :-------------------------- | :------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------- |
 | `surge [url]...`            | Launches local TUI. Queues optional URLs.                                              | `--batch, -b`<br>`--port, -p`<br>`--output, -o`<br>`--no-resume`<br>`--exit-when-done`<br>`--no-server` | `-o` defaults to CWD. If `--host` is set, this becomes remote TUI mode. `--no-server` disables the embedded HTTP API for that session. |
-| `surge server [url]...`     | Launches headless server. Queues optional URLs.                                        | `--batch, -b`<br>`--port, -p`<br>`--bind`<br>`--output, -o`<br>`--exit-when-done`<br>`--no-resume`<br>`--token` | `--bind` overrides the `network.bind_host` setting (default `0.0.0.0`); use `127.0.0.1` for local-only access. |
+| `surge server [url]...`     | Launches headless server. Queues optional URLs.                                        | `--batch, -b`<br>`--port, -p`<br>`--bind`<br>`--output, -o`<br>`--exit-when-done`<br>`--no-resume`<br>`--token` | `--bind` (`0.0.0.0` or `127.0.0.1`) overrides the `network.bind_host` setting (default `0.0.0.0`); use `127.0.0.1` for local-only access. |
 | `surge connect [host:port]` | Launches TUI connected to a server. Auto-detects local server when no target is given. | `--insecure-http`                                                                                   | Convenience alias for remote TUI usage.                                 |
 | `surge add <url>...`        | Queues downloads via CLI/API.                                                          | `--batch, -b`<br>`--output, -o`                                                                     | `-o` defaults to CWD. Alias: `get`.                                     |
 | `surge ls [id]`             | Lists downloads, or shows one download detail.                                         | `--json`<br>`--watch`<br>`--server-only`                                                          | Alias: `l`. `--server-only` requires a live server and disables the database fallback. |
@@ -117,9 +117,8 @@ and joins them with [`ffmpeg`](https://ffmpeg.org):
   join succeeds. A failed join keeps them, so a retry does not re-download.
 
 `ffmpeg` is required for this: without it such a page is refused with
-`extractor not available: only separate video and audio streams are offered;
-install ffmpeg to combine them` rather than downloading half a video. Override
-the binary with `SURGE_FFMPEG`.
+`this page needs ffmpeg to join its streams; install ffmpeg` rather than
+downloading half a video. Override the binary with `SURGE_FFMPEG`.
 
 Pause and resume work at stream granularity: a finished stream is recorded and
 not fetched again, while the stream that was in flight restarts. Completion is
@@ -180,6 +179,12 @@ fragment, and the chunk map stays empty.
 - **Media with no audio anywhere** — no progressive format, no audio stream to
   pair, no muxed playlist. Refused with
   `no single-file format available for this URL`; use yt-dlp directly.
+- **An expected SHA-256 on assembled media.** Separate streams and HLS
+  fragments are joined into a new container by ffmpeg, so no published digest
+  can match the result. A page that resolves to one direct file is still
+  verified as downloaded.
+
+A refused page fails at once with its reason; nothing is queued.
 
 Extracted media URLs are signed, short-lived and bound to your IP. Surge
 stores the page URL alongside the download and re-resolves it when you resume,

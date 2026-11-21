@@ -8,6 +8,7 @@ import (
 
 	"github.com/SurgeDM/Surge/internal/config"
 	"github.com/SurgeDM/Surge/internal/extractor"
+	"github.com/SurgeDM/Surge/internal/mux"
 	"github.com/SurgeDM/Surge/internal/store"
 	"github.com/SurgeDM/Surge/internal/types"
 )
@@ -292,5 +293,67 @@ func TestRefreshExtractedURLTakesAProbeSlotOnAnIdleDaemon(t *testing.T) {
 	if len(sem) != defaultMaxConcurrentProbes {
 		t.Errorf("probe pool holds %d tokens after the refresh, want %d",
 			len(sem), defaultMaxConcurrentProbes)
+	}
+}
+
+type availableMuxer struct{}
+
+func (availableMuxer) Name() string                                    { return "test" }
+func (availableMuxer) Available() bool                                 { return true }
+func (availableMuxer) Mux(context.Context, string, ...mux.Input) error { return nil }
+func (availableMuxer) Remux(context.Context, string, string) error     { return nil }
+
+// An expected SHA-256 describes bytes a server publishes. Media assembled by
+// ffmpeg from separate streams or fragments can never match it, so it is
+// refused up front; a single direct format is still verified as downloaded.
+func TestExtractMediaRefusesChecksumForAssembledMedia(t *testing.T) {
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for name, media := range map[string]*extractor.Media{
+		"parts":    {URL: "https://site/watch", SourceURL: "https://site/watch", Parts: []extractor.Part{{URL: "https://cdn/v", Kind: extractor.KindVideo}, {URL: "https://cdn/a", Kind: extractor.KindAudio}}},
+		"manifest": {URL: "https://site/watch", SourceURL: "https://site/watch", ManifestURL: "https://cdn/master.m3u8"},
+		"single":   {URL: "https://cdn/video.mp4", SourceURL: "https://site/watch"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mgr := &LifecycleManager{mediaExtractor: &fakeExtractor{available: true, media: media}, streamMuxer: availableMuxer{}}
+			req := &DownloadRequest{URL: "https://site/watch", Artifact: types.ArtifactPolicy{ExpectedSHA256: digest}}
+			_, err := mgr.extractMedia(context.Background(), req, mediaExtractionTimeout)
+			if refused := errors.Is(err, ErrChecksumNeedsSingleFile); refused != (name != "single") {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+// Hot-path resume after a live settings change (PATCH /settings): the
+// extractor and the downloader must use the same proxy, or an IP-bound media
+// URL resolved through one route is fetched through another.
+func TestRefreshExtractedURLUsesOneProxyForBothLegs(t *testing.T) {
+	tmpDir := t.TempDir()
+	store.Configure(filepath.Join(tmpDir, "surge.db"))
+	t.Cleanup(func() { store.CloseDB() })
+
+	initial := config.DefaultSettings() // proxy_url = "" at enqueue time
+	ex := &fakeExtractor{available: true, media: &extractor.Media{URL: "https://cdn.example/fresh.mp4", FormatID: "22"}}
+	mgr := NewLifecycleManager(nil, nil, initial)
+	mgr.SetMediaExtractor(ex)
+
+	// The paused in-memory record keeps the runtime built when it was enqueued.
+	entry := types.DownloadRecord{ID: "x", URL: "https://cdn.example/old.mp4", DestPath: filepath.Join(tmpDir, "c.mp4"),
+		Status: "paused", SourceURL: "https://site.example/watch?v=1", FormatID: "22"}
+	if err := store.AddToMasterList(entry); err != nil {
+		t.Fatal(err)
+	}
+	cfg := entry
+	cfg.Runtime = initial.ToRuntimeConfig()
+
+	// Live settings change while paused.
+	next := initial.Clone()
+	next.Network.ProxyURL.Value = "http://127.0.0.1:3128"
+	mgr.ApplySettings(next)
+
+	mgr.refreshExtractedURL(&cfg) // what Resume's hot path does before AddWithBeforeStart(*cfg)
+
+	if ex.gotOpts.ProxyURL != "http://127.0.0.1:3128" || cfg.Runtime.ProxyURL != ex.gotOpts.ProxyURL {
+		t.Fatalf("extractor resolved via proxy %q but the download will use proxy %q", ex.gotOpts.ProxyURL, cfg.Runtime.ProxyURL)
 	}
 }
