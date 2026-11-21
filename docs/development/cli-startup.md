@@ -10,7 +10,7 @@ to the command that needs it:
 | Configuration reads/writes | None | Only the requested configuration operation |
 | Explicit remote control commands (`--host` or `SURGE_HOST`) | None | Skip local state directories, settings, history, and logging initialization |
 | Remote TUI | None | Local presentation settings are still read for the UI |
-| Local control/listing commands | None | Existing local authentication/history/logging setup is retained |
+| Local control/listing commands | None | Local state directories, history and authentication; no debug log, because a log per invocation (the desktop widget polls `surge ls`) would rotate the server's own log out of retention |
 | Local TUI or `server start` | Created after the instance lock | Settings, state, logging, startup integrity, lifecycle worker, and transfers |
 
 `initializeLocalEngine` owns engine replacement and initialization. It drains the

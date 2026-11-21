@@ -92,7 +92,18 @@ The unit runs `surge server start --managed-service --bind 127.0.0.1`, starts
 at the user's default systemd target, restarts after crashes, and sends SIGTERM
 for Surge's existing clean shutdown path. `--managed-service` is how a server
 tells Surge it *is* the user service: without it, `surge server` sees
-`surge.service` active (its own unit) and refuses to start. Loopback binding keeps this automatically started API off
+`surge.service` active (its own unit) and refuses to start. A unit installed
+before this change, or a drop-in that sets its own `ExecStart`, still runs
+`surge server --bind …` and restarts in a loop after a Surge upgrade; change it
+to `server start --managed-service --bind 127.0.0.1` and run
+`systemctl --user daemon-reload`.
+
+Surge's own `surge service install`, `surge service uninstall` and the TUI's
+start-at-login setting manage the same `~/.config/systemd/user/surge.service`.
+They replace this hardened unit with a plain one, or remove it. The installer
+therefore also sets `network.bind_host` to `127.0.0.1`, so a regenerated unit
+still listens on loopback only; the hardening is lost until you rerun
+`install.sh`. Loopback binding keeps this automatically started API off
 the LAN; Bearer authentication is still required.
 
 ### Hardening
@@ -167,10 +178,10 @@ On its first start, surge server uses Surge's existing token provisioning:
 3. If no token exists, Surge generates one and writes it to
    $XDG_STATE_HOME/surge/token (normally ~/.local/state/surge/token) with
    mode 0600.
-4. Surge publishes the active port and a per-session runtime copy of the token
-   for local client discovery. Both the runtime directory and that copy are
-   owner-only (0700/0600); Surge tightens the modes on startup, so a
-   world-readable copy left by an older version is corrected.
+4. Surge publishes the active port in its runtime directory for local client
+   discovery. There is no runtime copy of the token: a local client reads the
+   state-file token, so the CLI the widget runs must see the same
+   `XDG_STATE_HOME` as the service (the default in a normal user session).
 5. The Quickshell widget invokes the Surge CLI. The CLI reads the credential
    and sends the existing Bearer-authenticated API request.
 

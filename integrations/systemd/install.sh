@@ -55,6 +55,15 @@ fi
 install -m 0644 "$unit_path.new" "$unit_path"
 rm -f "$unit_path.new"
 printf '%s\n' "ExecStart pinned to $surge_bin"
+
+# The unit's --bind keeps the API on loopback, but `surge service install`
+# and the TUI's start-at-login toggle regenerate surge.service without it.
+# The setting keeps loopback in force for any unit that reads it.
+if "$surge_bin" config network.bind_host 127.0.0.1 >/dev/null 2>&1; then
+  printf '%s\n' "Set network.bind_host to 127.0.0.1"
+else
+  printf '%s\n' "Could not set network.bind_host; only the unit's --bind keeps the API on loopback." >&2
+fi
 systemctl --user daemon-reload
 
 if [ "$enable_now" = true ]; then

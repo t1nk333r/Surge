@@ -216,17 +216,17 @@ func readPID() int {
 	return pid
 }
 
-func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost string, batchFile string, outputDir string, exitWhenDone bool, noResume bool, tokenOverride string) error {
-	var (
-		port     int
-		listener net.Listener
-		err      error
-	)
+// listenForServer binds the headless server: an explicit `--bind` host wins,
+// otherwise network.bind_host decides.
+func listenForServer(portFlag int, bindHost string) (int, net.Listener, error) {
 	if bindHost != "" {
-		port, listener, err = bindServerListenerOnHost(portFlag, bindHost)
-	} else {
-		port, listener, err = bindServerListener(portFlag)
+		return bindServerListenerOnHost(portFlag, bindHost)
 	}
+	return bindServerListener(portFlag)
+}
+
+func startServerLogic(cmd *cobra.Command, args []string, portFlag int, bindHost string, batchFile string, outputDir string, exitWhenDone bool, noResume bool, tokenOverride string) error {
+	port, listener, err := listenForServer(portFlag, bindHost)
 	if err != nil {
 		return err
 	}

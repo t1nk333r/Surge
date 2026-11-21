@@ -66,8 +66,42 @@ func TestFindAvailablePort_ReturnsListener(t *testing.T) {
 	}
 }
 
+// The desktop unit relies on `--bind 127.0.0.1` beating network.bind_host,
+// and a server with no flag must still follow the setting.
+func TestListenForServer_BindFlagOverridesSetting(t *testing.T) {
+	requireTCPListener(t)
+	setupIsolatedCmdState(t)
+	originalHost := activeBindHost
+	t.Cleanup(func() { activeBindHost = originalHost })
+
+	for _, tc := range []struct {
+		name, setting, flag, want string
+	}{
+		{name: "flag wins over all-interfaces setting", setting: "0.0.0.0", flag: "127.0.0.1", want: "127.0.0.1"},
+		{name: "setting applies without a flag", setting: "127.0.0.1", want: "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := config.DefaultSettings()
+			settings.Network.BindHost.Value = tc.setting
+			if err := config.SaveSettings(settings); err != nil {
+				t.Fatalf("save settings: %v", err)
+			}
+			_, ln, err := listenForServer(0, tc.flag)
+			if err != nil {
+				t.Fatalf("listenForServer: %v", err)
+			}
+			defer func() { _ = ln.Close() }()
+			if got := ln.Addr().(*net.TCPAddr).IP.String(); got != tc.want || activeBindHost != tc.want {
+				t.Fatalf("bound %s (activeBindHost %s), want %s", got, activeBindHost, tc.want)
+			}
+		})
+	}
+}
+
 func TestBindServerListenerOnHost_Loopback(t *testing.T) {
 	requireTCPListener(t)
+	originalHost := activeBindHost
+	t.Cleanup(func() { activeBindHost = originalHost })
 	port, ln, err := bindServerListenerOnHost(0, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("bindServerListenerOnHost failed: %v", err)
@@ -1632,5 +1666,41 @@ func TestResolveServerToken_FlagOverridesEnv(t *testing.T) {
 	got := resolveServerToken(serverCmd)
 	if got != "flag-token-xyz" {
 		t.Fatalf("resolveServerToken() = %q, want %q", got, "flag-token-xyz")
+	}
+}
+
+// Thin client commands run once per desktop-widget poll. Opening a debug log
+// per invocation pruned the server's own log out of retention within seconds,
+// so only an engine owner may create one.
+func TestInitializeClientStateOpensNoDebugLog(t *testing.T) {
+	setupIsolatedCmdState(t)
+	originalHost := globalHost
+	globalHost = ""
+	t.Setenv("SURGE_HOST", "")
+	t.Cleanup(func() { globalHost = originalHost })
+
+	countLogs := func() int {
+		entries, err := os.ReadDir(config.GetLogsDir())
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read logs dir: %v", err)
+		}
+		return len(entries)
+	}
+
+	before := countLogs()
+	for i := 0; i < 3; i++ {
+		if err := initializeClientState(); err != nil {
+			t.Fatalf("initializeClientState: %v", err)
+		}
+	}
+	if got := countLogs(); got != before {
+		t.Fatalf("client initialisation created %d log file(s)", got-before)
+	}
+
+	if err := initializeGlobalState(); err != nil {
+		t.Fatalf("initializeGlobalState: %v", err)
+	}
+	if countLogs() == before {
+		t.Fatal("engine initialisation opened no debug log; the contrast above proves nothing")
 	}
 }
