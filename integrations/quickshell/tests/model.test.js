@@ -60,6 +60,15 @@ assert.match(
   model.connectionError(1, "401 Unauthorized", ""),
   /rejected the token/
 );
+// `ls --json` includes each download's URL, which can be signed or carry
+// credentials; the widget keeps only the fields it renders.
+const withUrl = model.parseDownloads(JSON.stringify([
+  { id: "12345678", filename: "clip.mp4", status: "paused", url: "https://u:p@cdn.example/v?sig=1" },
+]));
+assert.equal(withUrl.length, 1);
+assert.equal(Object.prototype.hasOwnProperty.call(withUrl[0], "url"), false);
+assert.equal(JSON.stringify(withUrl).includes("sig=1"), false);
+
 assert.throws(() => model.parseDownloads("{}"), /non-array/);
 
 // Argument shapes. These guard the CLI argv the widget builds: an operand

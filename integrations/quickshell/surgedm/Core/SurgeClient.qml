@@ -90,6 +90,9 @@ Item {
       errorText = Model.connectionError(pollExitCode, pollError, pollOutput)
       changed()
     }
+    // `ls --json` lists each download's URL, which can be a signed media URL
+    // or carry credentials. Only the parsed rows, which drop it, are kept.
+    pollOutput = ""
 
     if (refreshPending) {
       refreshPending = false
