@@ -345,7 +345,7 @@ enable the widget first.
 | `command` | string | `surge` | Executable name on PATH, or an absolute path. |
 | `host` | string | empty | host:port or URL; empty auto-detects the local server. |
 | `refreshIntervalSec` | integer, 1–60 | `2` | Poll interval in **seconds**. |
-| `downloadDirectory` | string | empty | Destination for downloads added from the panel. |
+| `downloadDirectory` | string | empty | Destination for downloads added from the panel; empty uses the server's `default_download_dir` (the widget sends `--output=`). |
 | `serviceUnit` | string | `surge.service` | systemd user unit the power switch controls. |
 | `serviceControlsEnabled` | boolean | `true` | Show or hide the service power switch. |
 
@@ -362,7 +362,7 @@ Non-Omarchy Quickshell configurations set properties directly on
 | `surgeCommand` | string | `surge` | Executable name on PATH, or an absolute path. |
 | `host` | string | empty | host:port or URL; empty auto-detects the local server. |
 | `pollInterval` | int | `2000` | Poll interval in **milliseconds**; clamped to 500 minimum. |
-| `downloadDirectory` | string | empty | Destination for downloads added from the panel. |
+| `downloadDirectory` | string | empty | Destination for downloads added from the panel; empty uses the server's `default_download_dir` (the widget sends `--output=`). |
 | `serviceUnit` | string | `surge.service` | systemd user unit the service controls act on. |
 | `serviceControlsEnabled` | bool | `true` | Show or hide the service controls. |
 | `popupAbove` | bool | `false` | Open the panel upward, for a bottom bar. |

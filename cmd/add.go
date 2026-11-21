@@ -19,7 +19,7 @@ func newAddCommand() *cobra.Command {
 		RunE:  runAdd,
 	}
 	command.Flags().StringP("batch", "b", "", "File containing URLs to download (one per line)")
-	command.Flags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
+	command.Flags().StringP("output", "o", "", "Output directory (defaults to current working directory; an empty --output= uses the server's default download directory)")
 	command.Flags().Bool("confirm", false, "Request confirmation in the running TUI before starting downloads")
 	command.Flags().String("output-version", "", "Use a versioned JSON contract (supported: 1)")
 	command.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
@@ -54,7 +54,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	resolvedOutput := resolveClientOutputPath(output)
+	resolvedOutput := addOutputPath(cmd, output)
 	var items []submissionItem
 	if batchFile != "" && confirm {
 		items = collectConfirmedBatch(urls, resolvedOutput, baseURL, token)
@@ -94,3 +94,14 @@ func runAdd(cmd *cobra.Command, args []string) error {
 }
 
 func init() { rootCmd.AddCommand(addCmd) }
+
+// addOutputPath is the destination `add` sends. An explicitly empty --output
+// leaves it to the server, so a client with no meaningful working directory
+// (the desktop widget) gets the server's default download directory instead
+// of its own cwd.
+func addOutputPath(cmd *cobra.Command, output string) string {
+	if cmd.Flags().Changed("output") && strings.TrimSpace(output) == "" {
+		return ""
+	}
+	return resolveClientOutputPath(output)
+}

@@ -239,3 +239,28 @@ func TestReadSubmissionReceiptReportsMediaRefusal(t *testing.T) {
 		t.Fatal("an ordinary error was treated as a media refusal")
 	}
 }
+
+// `add --output=` defers to the server's default download directory; without
+// the flag a local add keeps using the caller's working directory.
+func TestAddOutputPathEmptyFlagDefersToServer(t *testing.T) {
+	originalHost := globalHost
+	globalHost = ""
+	t.Setenv("SURGE_HOST", "")
+	t.Cleanup(func() { globalHost = originalHost })
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unset := newAddCommand()
+	if got := addOutputPath(unset, ""); got != cwd {
+		t.Fatalf("no --output: got %q, want the working directory %q", got, cwd)
+	}
+	empty := newAddCommand()
+	if err := empty.Flags().Set("output", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := addOutputPath(empty, ""); got != "" {
+		t.Fatalf("--output= : got %q, want empty (server default)", got)
+	}
+}

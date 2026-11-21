@@ -139,6 +139,11 @@ Item {
         return false
       }
       args.push("--output", output)
+    } else {
+      // An explicitly empty --output leaves the folder to the server's
+      // default_download_dir. Without it the CLI sends its own working
+      // directory, which for a bar shell is $HOME.
+      args.push("--output=")
     }
     args.push("--", value)
     return runAction(args, "Download added.")
