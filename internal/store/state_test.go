@@ -2006,7 +2006,8 @@ func TestCategoryCopyReleasesMasterLockAndReservesOnlyMovingDownload(t *testing.
 		t.Run(fmt.Sprint("deferred=", deferred), func(t *testing.T) {
 			dir := setupTestDB(t)
 			defer func() { _ = os.RemoveAll(dir) }()
-			entry := types.DownloadRecord{ID: uuid.NewString(), Status: "completed", DestPath: filepath.Join(dir, "file.bin")}
+			entry := types.DownloadRecord{ID: uuid.NewString(), Status: "completed", DestPath: filepath.Join(dir, "file.bin"),
+				Parts: []types.DownloadPart{{URL: "https://cdn.example/v", Kind: types.PartKindVideo}}}
 			if deferred {
 				entry.Status = "paused"
 			}
@@ -2060,6 +2061,8 @@ func TestCategoryCopyReleasesMasterLockAndReservesOnlyMovingDownload(t *testing.
 				for _, mutate := range []func() error{
 					func() error { return SetCategory(entry.ID, "Other") },
 					func() error { return UpdateURL(entry.ID, "other") },
+					func() error { return ReplaceURL(entry.ID, "other") },
+					func() error { return SetPartComplete(entry.ID, 0) },
 					func() error { return UpdateRateLimit(entry.ID, 1) },
 					func() error { return DeleteState(entry.ID) },
 					func() error { return MoveCompletedCategory(entry.ID, "Other", destination) },

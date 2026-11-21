@@ -790,7 +790,9 @@ func CheckDownloadExists(url string) (bool, error) {
 		return false, err
 	}
 	for _, e := range list.Downloads {
-		if e.URL == url {
+		// An extracted download is recorded under its resolved media URL, so
+		// the page URL the user added is matched through SourceURL.
+		if e.URL == url || (e.SourceURL != "" && strings.TrimRight(e.SourceURL, "/") == url) {
 			return true, nil
 		}
 	}
@@ -916,6 +918,9 @@ func SetPartComplete(id string, index int) error {
 
 	masterMu.Lock()
 	defer masterMu.Unlock()
+	if movingDownloads[id] {
+		return types.ErrMoving
+	}
 
 	// The detail state is what a hot-path resume hydrates from, and it is
 	// written independently of the master list; update it even when the
