@@ -29,7 +29,10 @@ func CheckForDuplicate(url string, activeDownloads func() map[string]*types.Down
 		active := activeDownloads()
 		for _, d := range active {
 			normalizedExistingURL := strings.TrimRight(d.URL, "/")
-			if normalizedExistingURL == normalizedInputURL {
+			// An extracted download's URL is the resolved media URL; the page
+			// the user added is its SourceURL.
+			normalizedSourceURL := strings.TrimRight(d.SourceURL, "/")
+			if normalizedExistingURL == normalizedInputURL || (normalizedSourceURL != "" && normalizedSourceURL == normalizedInputURL) {
 				isActive := false
 				if d.ProgressState != nil && !progress.CfgProgress(d).Done.Load() {
 					isActive = true
