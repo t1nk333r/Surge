@@ -98,6 +98,17 @@ func TestListenForServer_BindFlagOverridesSetting(t *testing.T) {
 	}
 }
 
+// Local clients dial 127.0.0.1, so a --bind they cannot reach is refused
+// rather than started as a server nobody on this machine can talk to.
+func TestBindServerListenerOnHost_RejectsUnreachableHosts(t *testing.T) {
+	for _, host := range []string{"", "::1", "192.168.1.5", "localhost"} {
+		if _, ln, err := bindServerListenerOnHost(0, host); err == nil {
+			_ = ln.Close()
+			t.Errorf("bind host %q was accepted", host)
+		}
+	}
+}
+
 func TestBindServerListenerOnHost_Loopback(t *testing.T) {
 	requireTCPListener(t)
 	originalHost := activeBindHost

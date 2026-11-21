@@ -189,9 +189,11 @@ The QML source never contains, displays, copies, or directly reads the token.
 The token exists only in Surge's protected state/runtime files and in the
 short-lived Surge client process. It survives reboots through the state file.
 Existing tokens and manual SURGE_TOKEN configuration remain valid.
-The supplied service additionally binds to loopback. Users who deliberately
-change `--bind` to a non-loopback address must protect network access and
-should use a trusted HTTPS reverse proxy for remote clients.
+The supplied service additionally binds to loopback. `--bind` accepts only
+`127.0.0.1` or `0.0.0.0`, the same addresses as `network.bind_host`, because
+local clients and the widget always connect through 127.0.0.1. Users who
+deliberately change it to `0.0.0.0` must protect network access and should use
+a trusted HTTPS reverse proxy for remote clients.
 
 For an explicit service token, create the optional environment file with
 owner-only permissions:

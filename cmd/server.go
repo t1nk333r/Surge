@@ -177,7 +177,7 @@ func init() {
 
 	serverCmd.PersistentFlags().StringP("batch", "b", "", "File containing URLs to download")
 	serverCmd.PersistentFlags().IntP("port", "p", 0, "Port to listen on")
-	serverCmd.PersistentFlags().String("bind", "", "Address to listen on (overrides network.bind_host)")
+	serverCmd.PersistentFlags().String("bind", "", "Address to listen on: 0.0.0.0 or 127.0.0.1 (overrides network.bind_host)")
 	serverCmd.PersistentFlags().StringP("output", "o", "", "Output directory (defaults to current working directory)")
 	serverCmd.PersistentFlags().Bool("exit-when-done", false, "Exit when all downloads complete")
 	serverCmd.PersistentFlags().Bool("no-resume", false, "Do not auto-resume paused downloads on startup")

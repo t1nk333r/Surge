@@ -32,6 +32,12 @@ const (
 	LoopbackBindHost = "127.0.0.1"
 )
 
+// ValidateBindHost checks an HTTP API listen address, from the setting or
+// from `surge server --bind`, against the addresses local clients can reach.
+func ValidateBindHost(host string) error {
+	return validateBindHost(host)
+}
+
 func validateBindHost(val any) error {
 	sVal, ok := val.(string)
 	if !ok {

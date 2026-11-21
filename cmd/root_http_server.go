@@ -51,11 +51,13 @@ func bindServerListener(portFlag int) (int, net.Listener, error) {
 }
 
 // bindServerListenerOnHost binds an explicit host, such as `surge server
-// --bind`, which takes precedence over network.bind_host.
+// --bind`, which takes precedence over network.bind_host. It accepts the same
+// addresses as the setting: local clients always dial 127.0.0.1, so any other
+// address would start a server they cannot reach.
 func bindServerListenerOnHost(portFlag int, bindHost string) (int, net.Listener, error) {
 	bindHost = strings.TrimSpace(bindHost)
-	if bindHost == "" {
-		return 0, nil, fmt.Errorf("bind host cannot be empty")
+	if err := config.ValidateBindHost(bindHost); err != nil {
+		return 0, nil, fmt.Errorf("invalid bind host %q: %w", bindHost, err)
 	}
 
 	if portFlag > 0 {
