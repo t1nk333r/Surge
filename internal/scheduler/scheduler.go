@@ -373,8 +373,13 @@ func (p *Scheduler) Pause(downloadID string) PauseResult {
 
 	ad, exists := p.downloads[downloadID]
 	var configTotal int64
+	var estimatedTotal bool
 	if exists && ad != nil {
 		configTotal = ad.config.TotalSize
+		// A multi-part or fragmented download publishes the extractor's size
+		// estimate as its total, and the real streams often exceed it, so
+		// reaching that total says nothing about being finished.
+		estimatedTotal = len(ad.config.Parts) > 0 || ad.config.ManifestURL != ""
 	}
 	p.mu.Unlock()
 
@@ -394,7 +399,7 @@ func (p *Scheduler) Pause(downloadID string) PauseResult {
 		if total <= 0 {
 			total = configTotal
 		}
-		if total > 0 && prog.Bytes.VerifiedProgress.Load() >= total && !prog.Verifying.Load() {
+		if !estimatedTotal && total > 0 && prog.Bytes.VerifiedProgress.Load() >= total && !prog.Verifying.Load() {
 			return PauseResult{Found: true}
 		}
 

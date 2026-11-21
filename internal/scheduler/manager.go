@@ -219,6 +219,15 @@ func RunDownload(ctx context.Context, cfg *types.DownloadRecord) error {
 		}
 	}
 
+	// The media paths never publish EventPaused for the record (their streams
+	// run under their own IDs), while a typed ErrPaused tells the scheduler that
+	// event was already queued. Report their pause as a cancellation so the
+	// scheduler sends the record's fallback EventPaused.
+	if (cfg.ManifestURL != "" || len(cfg.Parts) > 0) && errors.Is(downloadErr, types.ErrPaused) {
+		utils.Debug("Media download paused cleanly")
+		return context.Canceled
+	}
+
 	// Return typed pause error rather than normalizing to nil so callers
 	// can distinguish a clean pause from successful completion or errors.
 	if errors.Is(downloadErr, types.ErrPaused) {
